@@ -75,11 +75,29 @@ The system uses an **ESP32-S3 Dev Module** (Dual-Core Xtensa LX7 @ 240 MHz) pair
 3. Open **Tools → Board → Boards Manager**, search for `esp32` by Espressif, and install version **2.0.14** or **3.x**.
 
 ### Required Arduino Libraries
-Open **Tools → Manage Libraries...** and install the following:
-1. **`tflm_esp32`** (v2.0.0 by Simone Salerno / EloquentArduino): Precompiled TensorFlow Lite Micro binaries for ESP32-S3.
-2. **`arduinoFFT`** (v2.0.4 by Enrique Condes / Bim Overbohm): Fast Fourier Transform library supporting templated single-precision `float`.
-3. **`WebSockets`** (by Markus Sattler): Lightweight client/server WebSocket transport (required if `ENABLE_NETWORK_STREAM = 1`).
-4. **`ArduinoJson`** (v6.x or v7.x by Benoit Blanchon): High-speed JSON serialization for telemetry and events.
+Open **Tools → Manage Libraries...** (or install into `Documents/Arduino/libraries/`):
+1. **`tflm_esp32`** (v2.0.0 by Simone Salerno / EloquentArduino): Precompiled TensorFlow Lite Micro binaries specifically built and optimized for ESP32-S3 Xtensa LX7.
+   - Provides `<tensorflow/lite/micro/micro_mutable_op_resolver.h>`
+   - Provides `<tensorflow/lite/micro/micro_interpreter.h>`
+   - Provides `<tensorflow/lite/schema/schema_generated.h>`
+   - Supports required ops: `Conv2D`, `DepthwiseConv2D`, `Add`, `MaxPool2D`, `Mean`, `FullyConnected`, `Softmax`.
+2. **`arduinoFFT`** (v2.0.4 by Enrique Condes / Bim Overbohm): Fast Fourier Transform library supporting templated single-precision `float` (`ArduinoFFT<float>`).
+   - Computes 512-point spectral feature extraction for MFCC (51 frames x 10 spectral channels).
+   - Computes real-time acoustic gatekeeper frequency thresholding (0-250 Hz noise vs 300-3400 Hz voice).
+3. **`WebSockets`** (v2.7.2 by Markus Sattler): Lightweight client/server WebSocket transport (required if `ENABLE_NETWORK_STREAM = 1`).
+4. **`ArduinoJson`** (v6.x or v7.x by Benoit Blanchon): High-speed JSON serialization for telemetry and events (required if `ENABLE_NETWORK_STREAM = 1`).
+
+> [!WARNING]
+> **TFLite Library Conflict Resolution**:
+> If you have multiple TensorFlow libraries installed in `Documents/Arduino/libraries/` (such as `EloquentTinyML`, `TensorFlowLite_ESP32`, `ArduTFLite`, `ESP_TF`), Arduino IDE may select an outdated library that lacks ESP32-S3 xtensa kernels or modern schema definitions (`schema_generated.h` / `AddAdd()`), causing compilation errors.
+>
+> **Action**: Keep **`tflm_esp32`** and remove or rename older versions:
+> ```bash
+> # In Windows PowerShell:
+> cd ~\Documents\Arduino\libraries
+> # Keep 'tflm_esp32' and move/remove legacy versions:
+> Remove-Item -Recurse -Force EloquentTinyML, TensorFlowLite_ESP32 -ErrorAction SilentlyContinue
+> ```
 
 ---
 
@@ -178,6 +196,14 @@ The embedded Keyword Spotting model is a **TENet Inverted Residual Convolutional
   - `Index 3`: `silence` (dead air)
   - `Index 4`: `unknown` (other conversational speech)
 * **Trigger Condition:** Raw INT8 score $\ge 0$ (corresponding to $\ge 50\%$ probability) with wake score strictly greater than negative and noise classes.
+
+### Offline Model Verification (Python)
+You can test and inspect the TFLite model directly in Python before flashing the ESP32-S3:
+```bash
+cd server
+python test_kws_model.py
+```
+This inspects the input tensor `[1, 51, 1, 10]`, quantization scales, output classes, and verifies that the model invokes cleanly.
 
 ---
 
