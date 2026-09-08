@@ -17,7 +17,7 @@
 
 // ---------------- BUILD FLAGS ----------------
 #define ENABLE_NETWORK_STREAM 0   // 0 = USB Serial (Prototype Demo), 1 = Wi-Fi WebSocket
-#define USE_FAKE_AUDIO        0   // 0 = Real INMP441 I2S microphone (GPIO 4, 5, 6)
+#define USE_FAKE_AUDIO        0   // 0 = Real INMP441 I2S microphone (GPIO 4, 5, 7)
 #define USE_PHYSICAL_BUTTON   1   // 1 = BOOT button (GPIO 0) backup trigger
 #define USE_STATUS_LED        1   // 1 = Status LED (GPIO 2)
 
@@ -35,10 +35,10 @@
 #define WS_PORT     8080
 #define WS_PATH     "/stream"
 
-// ---------------- PIN ASSIGNMENTS ----------------
-#define I2S_WS_PIN   4    // Word Select (White wire)
-#define I2S_SCK_PIN  5    // Continuous Serial Clock (Grey/Purple wire)
-#define I2S_SD_PIN   7    // Serial Data Out from mic (Blue wire plugged into GPIO 7)
+// ---------------- PIN ASSIGNMENTS (Soldered to GPIO 4, 5, 7) ----------------
+#define I2S_WS_PIN   4    // Word Select / LRCLK (GPIO 4)
+#define I2S_SCK_PIN  5    // Continuous Serial Clock / BCK (GPIO 5)
+#define I2S_SD_PIN   7    // Serial Data Out / SD (GPIO 7)
 #define I2S_PORT     I2S_NUM_0
 
 #define STATUS_LED_PIN     2    // Single-color LED fallback
