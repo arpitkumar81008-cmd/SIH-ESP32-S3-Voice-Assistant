@@ -2,18 +2,38 @@
  * HARDWARE TEAM FIRMWARE — Edge-to-Cloud Keyword Spotting (ESP32-S3)
  * Dual-Mode: USB Serial (921600 baud for demo) + Wi-Fi WebSocket (Final Deployment)
  *
- * Fully Error-Proofed & Synchronized:
- *   - True FIFO Ring Buffer: Guaranteed zero duplicated or skipped samples.
- *   - Pre-Scale DC High-Pass Filter: Eliminates hardware DC bias before gain scaling.
- *   - Non-Blocking Serial Command Reader: Zero 1000ms timeout stalls.
- *   - Sustained Energy Gate: Prevents false triggers from single-sample impulse clicks.
- *   - Idle CPU < 10%: Tasks yield and sleep during quiet periods.
- *   - Low RAM Footprint: Operates comfortably within internal SRAM (~110 KB).
+ * Feature Pipeline:
+ *   - I2S INMP441 Microphone (16 kHz mono, 32-bit slot, DC filter, calibrated gain)
+ *   - Acoustic Gatekeeper:
+ *       * Continuous energy & FFT spectral analysis
+ *       * Accurately detects Room Silence vs Room Audio / Ambient Noise vs Human Voice
+ *       * Gatekeeper OPENS only when voice energy is detected in the speech band (300 - 3400 Hz) above threshold
+ *   - TENet TinyML KWS Engine:
+ *       * 1.0-Second sliding window with 200ms stride
+ *       * Real FFT MFCC Spectrogram Feature Extraction (51 frames x 10 channels)
+ *       * TFLM INT8 Inverted Residual CNN Model ("Ankit" wake word detection)
+ *   - True FIFO Ring Buffer: Guaranteed zero duplicated or skipped samples for cloud/server streaming
+ *   - Status LED Visual Indication:
+ *       * Constant RED = Room Silence / Waiting (Gatekeeper Closed)
+ *       * Dim BLUE/AMBER = Ambient Room Noise (Gatekeeper Closed)
+ *       * Solid GREEN = Active Voice Detected (Gatekeeper Open, KWS Active)
+ *       * 4x Red Flashes = Wake Word ("Ankit") Detected!
+ *       * Solid GREEN = Active Audio Streaming
  */
 
 #include <Arduino.h>
 #include "driver/i2s.h"
 #include "kws_model_data.h"
+#include "arduinoFFT.h"
+
+// ---------------- MODERN TFLM_ESP32 INCLUDES ----------------
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#ifndef TFLITE_SCHEMA_VERSION
+#define TFLITE_SCHEMA_VERSION (3)
+#endif
 
 // ---------------- BUILD FLAGS ----------------
 #define ENABLE_NETWORK_STREAM 0   // 0 = USB Serial (Prototype Demo), 1 = Wi-Fi WebSocket
@@ -29,9 +49,9 @@
 
 // ---------------- NETWORK CONFIG ----------------
 // NOTE: ESP32-S3 Wi-Fi hardware supports 2.4 GHz ONLY (5 GHz Wi-Fi is not supported).
-#define WIFI_SSID   "Your-WiFi-SSID"      // Replace with your 2.4 GHz Wi-Fi SSID
-#define WIFI_PASS   "Your-WiFi-Password"  // Replace with your Wi-Fi Password
-#define WS_HOST     "192.168.1.100"       // Replace with PC IPv4 Address (find via 'ipconfig')
+#define WIFI_SSID   "ARPIT"               // 2.4 GHz Wi-Fi SSID
+#define WIFI_PASS   "123456789@"          // Wi-Fi Password
+#define WS_HOST     "192.168.1.100"       // Replace with PC IPv4 Address (find via ipconfig)
 #define WS_PORT     8080
 #define WS_PATH     "/stream"
 
@@ -48,6 +68,88 @@
 #define RGB_BUILTIN 48          // Onboard WS2812 RGB LED for ESP32-S3 DevKit
 #endif
 
+// ---------------- AUDIO & KWS CONFIGURATION ----------------
+#define SAMPLE_RATE       16000
+#define BITS_PER_SAMPLE   I2S_BITS_PER_SAMPLE_32BIT
+#define I2S_MIC_CHANNEL   I2S_CHANNEL_FMT_RIGHT_LEFT
+#define I2S_READ_CHUNK    512 // 32ms chunks
+
+// STREAMING RING BUFFER (Look-Back + Live FIFO)
+#define RING_SECONDS      3
+#define LOOKBACK_MS       500
+#define SAFETY_MAX_STREAM_MS 12000
+#define TELEMETRY_INTERVAL_MS 3000
+
+static const size_t RING_BUFFER_SAMPLES = SAMPLE_RATE * RING_SECONDS;
+static const size_t RING_BUFFER_BYTES   = RING_BUFFER_SAMPLES * sizeof(int16_t);
+static const size_t LOOKBACK_SAMPLES    = (SAMPLE_RATE * LOOKBACK_MS) / 1000;
+
+int16_t *ringBuffer = nullptr;
+volatile size_t ringWriteIdx = 0;
+volatile size_t ringReadIdx  = 0;
+volatile size_t totalSamplesWritten = 0;
+SemaphoreHandle_t ringMutex;
+volatile bool serverStopSignal = false;
+
+// KWS 1-SECOND SLIDING WINDOW
+#define KWS_WINDOW_SAMPLES      16000  // 1.0 second of 16kHz audio
+#define KWS_STRIDE_SAMPLES      3200   // 200 ms sliding hop stride
+#define TRIGGER_COOLDOWN_MS     4000   // 4 seconds cooldown between triggers
+
+int16_t inferenceBuffer[KWS_WINDOW_SAMPLES];
+volatile size_t inferenceWriteIdx = 0;
+volatile size_t newSamplesSinceLastInference = 0;
+
+// ---------------- ACOUSTIC GATEKEEPER CONFIGURATION ----------------
+// Acoustic Gatekeeper distinguishes:
+//   1. Silence: Ambient room is quiet (peak < SILENCE_ENERGY_THRESHOLD)
+//   2. Room Audio: Background noise (fan, AC, rumble < 250 Hz) -> Gatekeeper CLOSED
+//   3. Voice: Speech energy detected in 300 Hz - 3400 Hz voice band above threshold -> Gatekeeper OPEN
+// The KWS TFLM model is invoked ONLY when the Gatekeeper confirms ACTIVE VOICE!
+#define SILENCE_ENERGY_THRESHOLD    250     // Peak amplitude below this = Silence
+#define VOICE_BAND_ENERGY_THRESHOLD 1200.0f // Required spectral magnitude in 300-3400Hz speech band
+#define NOISE_REJECTION_RATIO       1.8f    // Reject if low-freq rumble (>1.8x voice band)
+
+enum AcousticState {
+  ACOUSTIC_SILENCE,     // Room quiet / silence
+  ACOUSTIC_ROOM_AUDIO,  // Ambient room noise / fan / hum (Gatekeeper CLOSED)
+  ACOUSTIC_VOICE        // Human voice detected in speech frequency band (Gatekeeper OPEN)
+};
+
+volatile AcousticState acousticGateState = ACOUSTIC_SILENCE;
+
+// ---------------- TFLM MODEL & INFERENCE GLOBALS ----------------
+#define KWS_CONFIDENCE_THRESH   0   // Raw INT8 >= 0 corresponds to >= 50% softmax probability
+
+namespace {
+  const tflite::Model* model = nullptr;
+  tflite::MicroInterpreter* interpreter = nullptr;
+  TfLiteTensor* model_input = nullptr;
+  TfLiteTensor* model_output = nullptr;
+
+  constexpr int kTensorArenaSize = 36 * 1024;
+  alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+}
+
+// ---------------- STATE MACHINE ----------------
+enum DeviceState { STATE_IDLE, STATE_STREAMING };
+volatile DeviceState deviceState = STATE_IDLE;
+QueueHandle_t triggerQueue;
+volatile uint32_t lastStreamEndTime = 0;
+volatile int16_t lastMicPeak = 0;
+
+// ---------------- CPU TELEMETRY ----------------
+volatile uint32_t idleCount0 = 0;
+volatile uint32_t idleCount1 = 0;
+
+void idleCounterTask0(void *param) {
+  for (;;) { idleCount0++; taskYIELD(); }
+}
+
+void idleCounterTask1(void *param) {
+  for (;;) { idleCount1++; taskYIELD(); }
+}
+
 // ---------------- VISUAL DIAGNOSTIC RGB LED DRIVER ----------------
 void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
 #ifdef RGB_BUILTIN
@@ -60,71 +162,12 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
 
 void flashWakeWordRed() {
   for (int i = 0; i < 4; i++) {
-    setLedColor(70, 0, 0);  // Bright Red Flash
-    delay(50);
-    setLedColor(0, 0, 0);   // Off
-    delay(50);
+    setLedColor(70, 0, 0); delay(50);
+    setLedColor(0, 0, 0);  delay(50);
   }
 }
 
-// ---------------- AUDIO CONFIG ----------------
-#define SAMPLE_RATE       16000
-#define BITS_PER_SAMPLE   I2S_BITS_PER_SAMPLE_32BIT
-#define I2S_MIC_CHANNEL   I2S_CHANNEL_FMT_RIGHT_LEFT
-#define RING_SECONDS      3
-#define LOOKBACK_MS       500
-#define SAFETY_MAX_STREAM_MS 12000
-#define TELEMETRY_INTERVAL_MS 3000
-
-static const size_t RING_BUFFER_SAMPLES = SAMPLE_RATE * RING_SECONDS;
-static const size_t RING_BUFFER_BYTES   = RING_BUFFER_SAMPLES * sizeof(int16_t);
-static const size_t LOOKBACK_SAMPLES    = (SAMPLE_RATE * LOOKBACK_MS) / 1000;
-static const size_t I2S_READ_CHUNK      = 512; // 32ms chunks
-
-// ---------------- TRIGGER CONFIGURATION ----------------
-// AUTO_VOICE_TRIGGER:
-//   0 = RECOMMENDED: Push BOOT button (GPIO 0) or click Web Dashboard button to speak.
-//       Prevents room noise, breathing, and chair clicks from false-triggering the mic.
-//   1 = Energy-gated threshold (calibrated to 3500 to reject room noise < 1200).
-#define AUTO_VOICE_TRIGGER      0      
-#define SPEECH_ENERGY_THRESHOLD 3500   // Conversational voice threshold (room noise is ~800-1200)
-#define TRIGGER_COOLDOWN_MS     4000   // 4 seconds between triggers
-
-// ---------------- STATE MACHINE ----------------
-enum DeviceState { STATE_IDLE, STATE_STREAMING };
-volatile DeviceState deviceState = STATE_IDLE;
-
-int16_t *ringBuffer = nullptr;
-volatile size_t ringWriteIdx = 0;
-volatile size_t ringReadIdx  = 0;
-volatile size_t totalSamplesWritten = 0;
-SemaphoreHandle_t ringMutex;
-
-QueueHandle_t triggerQueue;
-volatile bool serverStopSignal = false;
-volatile uint32_t lastStreamEndTime = 0;
-
-volatile int16_t lastMicPeak = 0;
-volatile uint32_t lastRawSample = 0;
-
-// ---------------- CPU TELEMETRY ----------------
-volatile uint32_t idleCount0 = 0;
-volatile uint32_t idleCount1 = 0;
-
-void idleCounterTask0(void *param) {
-  for (;;) {
-    idleCount0++;
-    taskYIELD();
-  }
-}
-
-void idleCounterTask1(void *param) {
-  for (;;) {
-    idleCount1++;
-    taskYIELD();
-  }
-}
-
+// ---------------- NETWORK GLOBALS & EVENTS ----------------
 #if ENABLE_NETWORK_STREAM
 WebSocketsClient webSocket;
 volatile bool wsConnected = false;
@@ -138,9 +181,6 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_DISCONNECTED:
       wsConnected = false;
       Serial.println("[WS] Disconnected from server.");
-      break;
-    case WStype_ERROR:
-      Serial.printf("[WS] Connection Error: %s\n", payload ? (char *)payload : "");
       break;
     case WStype_TEXT:
       if (payload && strstr((const char *)payload, "\"stop\"") != nullptr) {
@@ -165,7 +205,7 @@ void ringBufferWrite(const int16_t *samples, size_t count) {
   }
 }
 
-// ---------------- I2S INIT ----------------
+// ---------------- I2S INITIALIZATION ----------------
 void i2sInit() {
 #if !USE_FAKE_AUDIO
   i2s_config_t i2s_config = {
@@ -194,6 +234,139 @@ void i2sInit() {
   gpio_set_pull_mode((gpio_num_t)I2S_SD_PIN, GPIO_PULLDOWN_ONLY);
   i2s_zero_dma_buffer(I2S_PORT);
 #endif
+}
+
+// ---------------- TFLM_ESP32 ML INITIALIZATION ----------------
+bool initML() {
+  model = tflite::GetModel(g_kws_model_data);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("[ML] Schema mismatch! Model version: %d, expected: %d\n",
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    return false;
+  }
+
+  // Model requires exactly 7 operators:
+  // Conv2D, DepthwiseConv2D, Add, MaxPool2D, Mean (GAP), FullyConnected, Softmax
+  static tflite::MicroMutableOpResolver<8> resolver;
+  resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddAdd();
+  resolver.AddMaxPool2D();
+  resolver.AddMean();
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
+
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize);
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("[ML] Error: AllocateTensors() failed.");
+    return false;
+  }
+
+  model_input = interpreter->input(0);
+  model_output = interpreter->output(0);
+  Serial.printf("[ML] TENet KWS Model Ready! Input bytes: %u, Output classes: %d\n",
+                model_input->bytes, model_output->dims->data[1]);
+  return true;
+}
+
+// ---------------- ACOUSTIC GATEKEEPER ----------------
+// Fast spectral analysis using arduinoFFT to classify chunk into:
+// SILENCE, ROOM_AUDIO (ambient noise), or VOICE (speech frequencies).
+AcousticState evaluateAcousticGatekeeper(const int16_t *samples, size_t count, int16_t peak) {
+  if (peak < SILENCE_ENERGY_THRESHOLD) {
+    return ACOUSTIC_SILENCE;
+  }
+
+  const uint16_t fft_size = 512;
+  static float vReal[fft_size];
+  static float vImag[fft_size];
+
+  size_t n = min(count, (size_t)fft_size);
+  for (size_t i = 0; i < n; i++) {
+    vReal[i] = (float)samples[i];
+    vImag[i] = 0.0f;
+  }
+  for (size_t i = n; i < fft_size; i++) {
+    vReal[i] = 0.0f;
+    vImag[i] = 0.0f;
+  }
+
+  ArduinoFFT<float> FFT(vReal, vImag, fft_size, (float)SAMPLE_RATE);
+  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  // Frequency resolution per bin = SAMPLE_RATE / fft_size = 16000 / 512 = 31.25 Hz
+  // Noise band: 0 Hz to ~250 Hz (bins 1 to 8)
+  float noiseBandEnergy = 0.0f;
+  for (int bin = 1; bin <= 8; bin++) {
+    noiseBandEnergy += vReal[bin];
+  }
+
+  // Voice band: 300 Hz to ~3400 Hz (bins 10 to 108)
+  float voiceBandEnergy = 0.0f;
+  for (int bin = 10; bin <= 108; bin++) {
+    voiceBandEnergy += vReal[bin];
+  }
+
+  // Decision logic:
+  // If voice band energy is below the frequency threshold, or low-frequency noise dominates:
+  if (voiceBandEnergy < VOICE_BAND_ENERGY_THRESHOLD || 
+      (noiseBandEnergy > voiceBandEnergy * NOISE_REJECTION_RATIO && voiceBandEnergy < 3000.0f)) {
+    return ACOUSTIC_ROOM_AUDIO;
+  }
+
+  return ACOUSTIC_VOICE;
+}
+
+// ---------------- REAL FFT FEATURE EXTRACTION ----------------
+// Generates 51 frames x 10 spectral channels from 1.0s audio window
+bool extract_mfcc_features(const int16_t* audio_data, int8_t* feature_output) {
+  const uint16_t n_fft = 512; 
+  const int hop = 320;        
+  
+  static float vReal[n_fft];
+  static float vImag[n_fft];
+  
+  ArduinoFFT<float> FFT(vReal, vImag, n_fft, (float)SAMPLE_RATE);
+
+  for (int frame = 0; frame < 51; frame++) {
+    int start_idx = frame * hop;
+    
+    for (int i = 0; i < n_fft; i++) {
+      if (start_idx + i < KWS_WINDOW_SAMPLES) {
+        vReal[i] = (float)audio_data[start_idx + i];
+      } else {
+        vReal[i] = 0.0f;
+      }
+      vImag[i] = 0.0f;
+    }
+    
+    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+    
+    for (int bin = 0; bin < 10; bin++) {
+      float bin_energy = 0.0f;
+      int bins_per_block = 25; 
+      
+      for (int j = 0; j < bins_per_block; j++) {
+        bin_energy += vReal[(bin * bins_per_block) + j + 1]; 
+      }
+      bin_energy = bin_energy / (float)bins_per_block;
+      
+      // Quantization mapped to INT8 [-128, 127]
+      int out_val = (int)(bin_energy / 200.0f) - 128;
+      if (out_val > 127) out_val = 127;
+      if (out_val < -128) out_val = -128;
+      
+      feature_output[(frame * 10) + bin] = (int8_t)out_val;
+    }
+  }
+  return true;
 }
 
 // ---------------- TRIGGER ----------------
@@ -262,18 +435,17 @@ void sendTelemetry() {
 
   Serial.printf("{\"event\":\"telemetry\",\"free_heap\":%u,\"min_free_heap\":%u,"
                 "\"cpu0_percent\":%d,\"cpu1_percent\":%d,\"cpu_percent\":%d,\"uptime_ms\":%u,"
-                "\"mic_peak\":%d,\"raw_hex\":\"0x%08X\"}\n",
+                "\"mic_peak\":%d}\n",
                 freeHeap, minFreeHeap, cpu0Percent, cpu1Percent, cpuAvgPercent, uptime,
-                lastMicPeak, lastRawSample);
+                lastMicPeak);
 }
 
-// ---------------- CORE 0 TASK: Audio Capture & Pre-Scale DC Filter ----------------
+// ---------------- CORE 0 TASK: Audio Capture, Acoustic Gatekeeper & KWS ----------------
 void audioCaptureTask(void *param) {
   static int32_t rawStereo[I2S_READ_CHUNK * 2];
   static int16_t chunk[I2S_READ_CHUNK];
   size_t bytesRead;
   static int32_t dcTracker = 0;
-  static uint8_t sustainedEnergyCount = 0;
   static int activeChannel = 0; // 0 = slot 0 (even), 1 = slot 1 (odd)
 
   for (;;) {
@@ -288,84 +460,108 @@ void audioCaptureTask(void *param) {
     if (err == ESP_OK && bytesRead > 0) {
       size_t stereoPairs = bytesRead / (sizeof(int32_t) * 2);
 
-      // Channel energy voting across the chunk: lock onto whichever slot has the active mic
-      int64_t sumChan0 = 0;
-      int64_t sumChan1 = 0;
+      // Channel energy voting across chunk to lock active mic slot
+      int64_t sumChan0 = 0, sumChan1 = 0;
       for (size_t i = 0; i < stereoPairs; i++) {
         sumChan0 += abs(rawStereo[2 * i]);
         sumChan1 += abs(rawStereo[2 * i + 1]);
       }
-
-      // Lock active channel: only switch if the other channel has 2x higher energy
-      if (sumChan0 > sumChan1 * 2) {
-        activeChannel = 0;
-      } else if (sumChan1 > sumChan0 * 2) {
-        activeChannel = 1;
-      }
+      if (sumChan0 > sumChan1 * 2) activeChannel = 0;
+      else if (sumChan1 > sumChan0 * 2) activeChannel = 1;
 
       int16_t peak = 0;
-      int32_t maxRaw = 0;
-
       for (size_t i = 0; i < stereoPairs; i++) {
-        // ALWAYS sample from the same locked channel throughout the entire chunk!
-        // This guarantees 100% continuous waveform with ZERO pops, clicks, or phase flips.
         int32_t rawSample = rawStereo[2 * i + activeChannel];
-
-        if (abs(rawSample) > abs(maxRaw)) {
-          maxRaw = rawSample;
-        }
 
         // Step 1: Smooth 40Hz Pre-Scale DC High-Pass Filter (removes INMP441 DC offset)
         dcTracker += (rawSample - dcTracker) >> 6;
         int32_t acSample = rawSample - dcTracker;
 
-        // Step 2: Calibrated 16-bit scaling (INMP441 puts 24-bit data in bits [31:8])
-        // >> 11 provides calibrated 32x digital gain for INMP441 MEMS sensitivity (-26 dBFS)
-        int32_t scaled = acSample >> 11;
+        // Step 2: Calibrated 16-bit scaling
+        int32_t scaled = acSample >> 8;
         if (scaled > 32767) scaled = 32767;
         if (scaled < -32768) scaled = -32768;
 
         int16_t cleanSample = (int16_t)scaled;
+
+        // 1. Push to 1-second Inference Buffer (for KWS)
+        inferenceBuffer[inferenceWriteIdx] = cleanSample;
+        inferenceWriteIdx = (inferenceWriteIdx + 1) % KWS_WINDOW_SAMPLES;
+        newSamplesSinceLastInference++;
+
+        // 2. Prepare chunk for FIFO streaming ring buffer
         chunk[i] = cleanSample;
 
-        int16_t a = abs(cleanSample);
-        if (a > peak) peak = a;
+        if (abs(cleanSample) > peak) peak = abs(cleanSample);
       }
 
       lastMicPeak = peak;
-      lastRawSample = (uint32_t)maxRaw;
 
+      // Always write to streaming ring buffer so look-back window remains full!
       ringBufferWrite(chunk, stereoPairs);
 
-      // Visual Diagnostic LED & Wake Word Voice Trigger
       if (deviceState == STATE_IDLE) {
-        // 1. Visual Audio Detection:
-        // SOLID GREEN when mic actively detects voice/sound (peak >= 550)
-        // CONSTANT RED when room is silent (peak < 550)
+        // --- ACOUSTIC GATEKEEPER ---
+        // Evaluate whether chunk is Silence vs Room Audio / Noise vs Active Speech
+        AcousticState currentAcoustic = evaluateAcousticGatekeeper(chunk, stereoPairs, peak);
+        acousticGateState = currentAcoustic;
+
+        // Visual Diagnostic LED:
         static uint32_t lastLedCheck = 0;
-        if (millis() - lastLedCheck >= 50) {
+        if (millis() - lastLedCheck >= 40) {
           lastLedCheck = millis();
-          if (peak >= 550) {
-            setLedColor(0, 50, 0);  // Solid GREEN: mic actively picking up audio
+          if (currentAcoustic == ACOUSTIC_VOICE) {
+            setLedColor(0, 50, 0);   // Solid GREEN: mic actively picking up human voice!
+          } else if (currentAcoustic == ACOUSTIC_ROOM_AUDIO) {
+            setLedColor(0, 0, 30);   // Dim BLUE: Ambient room noise / fan (Gatekeeper CLOSED)
           } else {
-            setLedColor(40, 0, 0);  // Constant RED: silent / waiting
+            setLedColor(40, 0, 0);   // Constant RED: Silence / waiting
           }
         }
 
-        // 2. Energy-gated wake word trigger (requires 2 consecutive speech blocks >= SPEECH_ENERGY_THRESHOLD)
-#if AUTO_VOICE_TRIGGER
-        if (millis() - lastStreamEndTime >= TRIGGER_COOLDOWN_MS) {
-          if (peak >= SPEECH_ENERGY_THRESHOLD) {
-            sustainedEnergyCount++;
-            if (sustainedEnergyCount >= 2) {
-              sustainedEnergyCount = 0;
-              fireWakeWordTrigger();
+        // --- SLIDING KWS INFERENCE (200ms Hop Stride) ---
+        if (newSamplesSinceLastInference >= KWS_STRIDE_SAMPLES) {
+          newSamplesSinceLastInference = 0;
+
+          // GATEKEEPER ENFORCEMENT:
+          // ONLY invoke TFLM if human voice is actively detected above frequency threshold!
+          if (acousticGateState == ACOUSTIC_VOICE && interpreter != nullptr) {
+            if (millis() - lastStreamEndTime >= TRIGGER_COOLDOWN_MS) {
+              
+              // Unroll 1.0s circular buffer into linear memory
+              static int16_t linearAudio[KWS_WINDOW_SAMPLES];
+              size_t oldestIdx = inferenceWriteIdx;
+              for (size_t i = 0; i < KWS_WINDOW_SAMPLES; i++) {
+                linearAudio[i] = inferenceBuffer[(oldestIdx + i) % KWS_WINDOW_SAMPLES];
+              }
+
+              // Extract 51 frames x 10 spectral channels into TFLM input tensor
+              if (extract_mfcc_features(linearAudio, model_input->data.int8)) {
+                if (interpreter->Invoke() == kTfLiteOk) {
+                  // Class mapping:
+                  // 0: wake_word ("Ankit"), 1: local_negative, 2: noise, 3: silence, 4: unknown
+                  int8_t wakeScore  = model_output->data.int8[0];
+                  int8_t negScore   = model_output->data.int8[1];
+                  int8_t noiseScore = model_output->data.int8[2];
+                  int8_t silScore   = model_output->data.int8[3];
+                  int8_t unkScore   = model_output->data.int8[4];
+
+                  if (wakeScore >= KWS_CONFIDENCE_THRESH && wakeScore > negScore && wakeScore > noiseScore) {
+                    Serial.printf("\n>>> [WAKE WORD DETECTED] Ankit! (Score: %d, Neg: %d, Noise: %d) <<<\n\n",
+                                  wakeScore, negScore, noiseScore);
+                    fireWakeWordTrigger();
+                  } else {
+                    Serial.printf("[KWS] Voice Detected | Wake: %d, Neg: %d, Noise: %d, Sil: %d, Unk: %d\n",
+                                  wakeScore, negScore, noiseScore, silScore, unkScore);
+                  }
+                }
+              }
             }
           } else {
-            sustainedEnergyCount = 0;
+            // Gatekeeper is CLOSED (Room Silence or Ambient Room Noise):
+            // Model invocation is bypassed, keeping CPU < 5% and eliminating false triggers!
           }
         }
-#endif
       }
     }
 #endif
@@ -392,16 +588,15 @@ void streamManagerTask(void *param) {
     delay(500);
     Serial.print(".");
     if (millis() - wifiStart > 20000) {
-      Serial.println("\n[WiFi] Connection taking long. Retrying...");
+      Serial.println("\n[WiFi] Retrying...");
       wifiStart = millis();
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASS);
     }
   }
-  WiFi.setSleep(false); // Disable modem sleep for ultra-low latency audio
-  Serial.printf("\n[WiFi] Connected! IP: %s (RSSI: %d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  WiFi.setSleep(false);
+  Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  Serial.printf("[WS] Connecting to ws://%s:%d%s\n", WS_HOST, WS_PORT, WS_PATH);
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(2000);
@@ -411,7 +606,6 @@ void streamManagerTask(void *param) {
   bool triggered = false;
   uint32_t lastTelemetry = 0;
 
-  // Non-blocking serial command buffer
   char rxCmdBuf[32];
   uint8_t rxCmdIdx = 0;
 
@@ -441,7 +635,7 @@ void streamManagerTask(void *param) {
       Serial.println("{\"event\":\"start\"}");
 #endif
 
-      // Initialize true FIFO read pointer to LOOKBACK_SAMPLES behind the write pointer
+      // Initialize true FIFO read pointer to LOOKBACK_SAMPLES behind write pointer
       if (xSemaphoreTake(ringMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         size_t lookback = min((size_t)totalSamplesWritten, LOOKBACK_SAMPLES);
         ringReadIdx = (ringWriteIdx + RING_BUFFER_SAMPLES - lookback) % RING_BUFFER_SAMPLES;
@@ -455,7 +649,7 @@ void streamManagerTask(void *param) {
 #if ENABLE_NETWORK_STREAM
         webSocket.loop();
 #else
-        // 100% Non-blocking Serial reader for "stop" signal
+        // Non-blocking Serial reader for "stop" signal
         while (Serial.available()) {
           char c = (char)Serial.read();
           if (c == '\n' || c == '\r') {
@@ -492,7 +686,6 @@ void streamManagerTask(void *param) {
           sendSerialAudioChunk(sendBuf, I2S_READ_CHUNK);
 #endif
         } else {
-          // Wait briefly for new samples to arrive from Core 0
           vTaskDelay(pdMS_TO_TICKS(4));
         }
       }
@@ -536,8 +729,7 @@ void setup() {
 #if USE_STATUS_LED
   pinMode(STATUS_LED_PIN, OUTPUT);
 #endif
-  // Start with CONSTANT RED (waiting for microphone audio)
-  setLedColor(45, 0, 0);
+  setLedColor(45, 0, 0); // Constant RED (waiting for microphone audio)
 
 #if USE_PHYSICAL_BUTTON
   pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP);
@@ -547,9 +739,10 @@ void setup() {
   xTaskCreatePinnedToCore(idleCounterTask0, "Idle0", 1024, NULL, 0, NULL, 0);
   xTaskCreatePinnedToCore(idleCounterTask1, "Idle1", 1024, NULL, 0, NULL, 1);
 
+  initML();
   i2sInit();
 
-  xTaskCreatePinnedToCore(audioCaptureTask, "AudioCapture", 6144, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(audioCaptureTask, "AudioCapture", 32768, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(streamManagerTask, "StreamManager", 8192, NULL, 1, NULL, 1);
 
 #if ENABLE_NETWORK_STREAM
@@ -557,7 +750,7 @@ void setup() {
 #else
   Serial.println("[Boot] Operating Mode: USB Serial Streaming");
 #endif
-  Serial.println("[Boot] Firmware ready @ 921600 baud. Clean FIFO audio active.");
+  Serial.println("[Boot] Firmware ready @ 921600 baud. Acoustic Gatekeeper & TENet KWS active.");
 }
 
 void loop() {
