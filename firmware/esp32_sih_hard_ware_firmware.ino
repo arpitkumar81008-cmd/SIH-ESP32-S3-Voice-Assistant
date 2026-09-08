@@ -81,10 +81,14 @@ static const size_t RING_BUFFER_BYTES   = RING_BUFFER_SAMPLES * sizeof(int16_t);
 static const size_t LOOKBACK_SAMPLES    = (SAMPLE_RATE * LOOKBACK_MS) / 1000;
 static const size_t I2S_READ_CHUNK      = 512; // 32ms chunks
 
-// Speech detection threshold: voice is ~1500 to 4500, quiet room is ~200 to 450
-#define AUTO_VOICE_TRIGGER      1      // 1 = Voice volume trigger enabled, 0 = BOOT button only
-#define SPEECH_ENERGY_THRESHOLD 850    // Conversational speech threshold (calibrated for INMP441)
-#define TRIGGER_COOLDOWN_MS     3000   // 3 seconds between triggers
+// ---------------- TRIGGER CONFIGURATION ----------------
+// AUTO_VOICE_TRIGGER:
+//   0 = RECOMMENDED: Push BOOT button (GPIO 0) or click Web Dashboard button to speak.
+//       Prevents room noise, breathing, and chair clicks from false-triggering the mic.
+//   1 = Energy-gated threshold (calibrated to 3500 to reject room noise < 1200).
+#define AUTO_VOICE_TRIGGER      0      
+#define SPEECH_ENERGY_THRESHOLD 3500   // Conversational voice threshold (room noise is ~800-1200)
+#define TRIGGER_COOLDOWN_MS     4000   // 4 seconds between triggers
 
 // ---------------- STATE MACHINE ----------------
 enum DeviceState { STATE_IDLE, STATE_STREAMING };
