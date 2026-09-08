@@ -1,0 +1,1813 @@
+<!DOCTYPE html>
+<html lang="en" class="dark" style="background-color: #0a0d14; color: #f8fafc;">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32-S3 Real-Time Telemetry & Live Voice Spectrogram</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <style>
+    /* ==========================================================================
+       CYBER-TELEMETRY EMBEDDED STYLES (Guaranteed Dark Theme)
+       ========================================================================== */
+    :root {
+      --bg-primary: #0a0d14;
+      --bg-secondary: #0f1422;
+      --bg-card: rgba(18, 24, 38, 0.85);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(0, 240, 255, 0.35);
+      --accent-cyan: #00f0ff;
+      --accent-cyan-glow: rgba(0, 240, 255, 0.35);
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --accent-purple: #8b5cf6;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    }
+
+    html, body {
+      background-color: #0a0d14 !important;
+      color: #f8fafc !important;
+      min-height: 100vh;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    body {
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(0, 240, 255, 0.05) 0%, transparent 40%),
+        radial-gradient(circle at 85% 80%, rgba(139, 92, 246, 0.05) 0%, transparent 40%),
+        linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 32px 32px, 32px 32px;
+      overflow-x: hidden;
+    }
+
+    /* Glassmorphism Dark Cards */
+    .glass-panel {
+      background-color: #0f1422 !important;
+      background: rgba(15, 20, 34, 0.9) !important;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.1) !important;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+    }
+
+    /* Monospace */
+    .font-mono-stat {
+      font-family: var(--font-mono);
+      font-feature-settings: "tnum" 1, "zero" 1;
+    }
+
+    /* Circular SVG Gauge */
+    .gauge-svg {
+      transform: rotate(-90deg);
+    }
+    .gauge-bg {
+      stroke: rgba(255, 255, 255, 0.08);
+    }
+    .gauge-progress {
+      transition: stroke-dashoffset 0.35s ease, stroke 0.3s ease;
+      stroke-linecap: round;
+    }
+
+    /* Pulse animation */
+    @keyframes pulse-glow {
+      0%, 100% { opacity: 1; transform: scale(1); filter: drop-shadow(0 0 6px currentColor); }
+      50% { opacity: 0.6; transform: scale(0.95); filter: drop-shadow(0 0 2px currentColor); }
+    }
+    .pulse-indicator {
+      animation: pulse-glow 2s infinite ease-in-out;
+    }
+
+    /* Sliders */
+    input[type=range] {
+      -webkit-appearance: none;
+      appearance: none;
+      background: rgba(255, 255, 255, 0.15);
+      height: 6px;
+      border-radius: 3px;
+      outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #00f0ff;
+      cursor: pointer;
+      box-shadow: 0 0 8px #00f0ff;
+    }
+
+    /* Canvas Containers */
+    .canvas-container {
+      position: relative;
+      width: 100%;
+      background-color: #05070a !important;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .spectrogram-canvas {
+      display: block;
+      width: 100%;
+      height: 300px;
+      background-color: #05070a;
+      image-rendering: pixelated;
+    }
+    .scope-canvas {
+      display: block;
+      width: 100%;
+      height: 90px;
+      background-color: #080b11;
+    }
+
+    /* Frequency Axis Overlay */
+    .freq-axis {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 46px;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 6px 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.6);
+      background: linear-gradient(90deg, rgba(5,7,10,0.9) 65%, transparent);
+      border-right: 1px dashed rgba(255, 255, 255, 0.2);
+    }
+
+    /* VAD Pill */
+    .vad-badge {
+      transition: all 0.2s ease;
+    }
+    .vad-active {
+      background-color: rgba(16, 185, 129, 0.25) !important;
+      color: #10b981 !important;
+      border-color: #10b981 !important;
+      box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+    }
+
+
+    /* Wake word + speech transcript */
+    .transcript-box {
+      min-height: 92px;
+      max-height: 190px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(0, 240, 255, 0.35) transparent;
+    }
+
+    .transcript-box::-webkit-scrollbar { width: 6px; }
+    .transcript-box::-webkit-scrollbar-thumb {
+      background: rgba(0, 240, 255, 0.35);
+      border-radius: 999px;
+    }
+
+    .wake-status {
+      transition: all 0.2s ease;
+    }
+  </style>
+</head>
+<body class="p-3 md:p-6 text-slate-100 antialiased selection:bg-cyan-500 selection:text-black">
+
+  <div class="max-w-7xl mx-auto space-y-5">
+
+    <!-- Top Header & Connection Bar -->
+    <header class="glass-panel p-4 flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shadow-[0_0_15px_rgba(0,240,255,0.2)]">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="text-lg font-bold tracking-wider text-white">ESP32-S3 TELEMETRY & AUDIO LAB</h1>
+            <span class="text-[10px] font-mono uppercase bg-cyan-500/20 text-cyan-300 px-2 py-0.5 rounded border border-cyan-500/30">Live Stream</span>
+          </div>
+          <p class="text-xs text-slate-400">Xtensa Dual-Core LX7 @ 240MHz &bull; I2S DMA Voice Capture &bull; FreeRTOS Telemetry</p>
+        </div>
+      </div>
+
+      <!-- Controls & Mode Selector -->
+      <div class="flex flex-wrap items-center gap-3">
+        <select id="mode-select" class="text-xs bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-3 py-2 font-mono">
+          <option value="serial" selected>USB-C WebSerial</option>
+          <option value="ws">Wi-Fi WebSocket (ws://)</option>
+          <option value="sim">Simulation / Demo Mode</option>
+        </select>
+
+        <!-- WebSocket Input Container -->
+        <div id="ws-controls" class="hidden items-center space-x-2">
+          <input type="text" id="ws-url" value="ws://192.168.4.1:81/ws" placeholder="ws://esp32-ip:81/ws" class="text-xs bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 w-48 font-mono text-cyan-300 focus:border-cyan-500 outline-none">
+          <button id="btn-ws-connect" class="text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold px-4 py-2 rounded-lg transition shadow-[0_0_10px_rgba(0,240,255,0.3)]">Connect</button>
+        </div>
+
+        <!-- Serial Input Container -->
+        <div id="serial-controls" class="flex items-center space-x-2">
+          <select id="serial-baud" class="text-xs bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-2 py-2 font-mono">
+            <option value="921600">921600 Baud</option>
+            <option value="115200">115200 Baud</option>
+            <option value="2000000">2000000 Baud</option>
+          </select>
+          <button id="btn-serial-connect" class="text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold px-4 py-2 rounded-lg transition shadow-[0_0_10px_rgba(0,240,255,0.3)]">Connect USB</button>
+        </div>
+
+        <!-- Simulation Start/Stop -->
+        <div id="sim-controls" class="hidden items-center space-x-2">
+          <button id="btn-sim-toggle" class="text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-lg transition shadow-[0_0_10px_rgba(16,185,129,0.3)]">Restart Demo</button>
+        </div>
+
+        <!-- Status Pill -->
+        <div id="status-badge" class="flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono border bg-rose-950/50 border-rose-500/40 text-rose-300">
+          <span id="status-led" class="w-2 h-2 rounded-full bg-rose-400"></span>
+          <span id="status-text">Connecting to Server...</span>
+        </div>
+
+        <!-- Web Trigger Button -->
+        <button onclick="triggerESP()" class="text-xs bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold px-3.5 py-1.5 rounded-lg transition shadow-[0_0_12px_rgba(0,240,255,0.3)] active:scale-95 flex items-center gap-1.5">
+          <span>🎙️ Trigger (BOOT)</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Telemetry Cards Grid -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+
+      <!-- Card 1: Latency & Jitter -->
+      <div class="glass-panel p-4 flex flex-col justify-between space-y-3">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span class="font-medium tracking-wide">ROUNDTRIP LATENCY</span>
+          <span class="font-mono text-cyan-400 text-[10px] bg-cyan-950/50 px-1.5 py-0.5 rounded border border-cyan-800">PING / RTT</span>
+        </div>
+        <div>
+          <div class="flex items-baseline space-x-2">
+            <span id="val-latency" class="text-3xl font-bold font-mono text-cyan-300">-- ms</span>
+            <span id="val-jitter" class="text-xs font-mono text-slate-400">&plusmn;-- ms</span>
+          </div>
+          <div class="flex justify-between text-[10px] font-mono text-slate-400 mt-1 border-t border-white/5 pt-1.5">
+            <span>MIN: <strong id="val-latency-min" class="text-slate-200">-- ms</strong></span>
+            <span>AVG: <strong id="val-latency-avg" class="text-slate-200">-- ms</strong></span>
+            <span>MAX: <strong id="val-latency-max" class="text-slate-200">-- ms</strong></span>
+          </div>
+        </div>
+        <!-- Sparkline -->
+        <div class="h-12 w-full bg-slate-950/60 rounded border border-white/5 overflow-hidden">
+          <canvas id="latency-sparkline" class="w-full h-12 block" width="280" height="48"></canvas>
+        </div>
+      </div>
+
+      <!-- Card 2: Dual-Core CPU Load -->
+      <div class="glass-panel p-4 flex flex-col justify-between space-y-2">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span class="font-medium tracking-wide">DUAL-CORE CPU LOAD</span>
+          <span class="font-mono text-purple-400 text-[10px] bg-purple-950/50 px-1.5 py-0.5 rounded border border-purple-800">XTENSA LX7</span>
+        </div>
+        <div class="flex items-center justify-around py-1">
+          <!-- Core 0 -->
+          <div class="flex flex-col items-center">
+            <div class="relative w-20 h-20 flex items-center justify-center">
+              <svg class="w-full h-full gauge-svg" viewBox="0 0 88 88">
+                <circle class="gauge-bg" cx="44" cy="44" r="38" stroke-width="7" fill="none"/>
+                <circle id="gauge-cpu0" class="gauge-progress" cx="44" cy="44" r="38" stroke="#00f0ff" stroke-width="7" fill="none" stroke-dasharray="238.76" stroke-dashoffset="238.76"/>
+              </svg>
+              <div class="absolute text-center">
+                <span id="val-cpu0" class="text-xs font-bold font-mono text-cyan-300">--%</span>
+              </div>
+            </div>
+            <span class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">CORE 0 (WiFi/RTOS)</span>
+          </div>
+
+          <!-- Core 1 -->
+          <div class="flex flex-col items-center">
+            <div class="relative w-20 h-20 flex items-center justify-center">
+              <svg class="w-full h-full gauge-svg" viewBox="0 0 88 88">
+                <circle class="gauge-bg" cx="44" cy="44" r="38" stroke-width="7" fill="none"/>
+                <circle id="gauge-cpu1" class="gauge-progress" cx="44" cy="44" r="38" stroke="#8b5cf6" stroke-width="7" fill="none" stroke-dasharray="238.76" stroke-dashoffset="238.76"/>
+              </svg>
+              <div class="absolute text-center">
+                <span id="val-cpu1" class="text-xs font-bold font-mono text-purple-300">--%</span>
+              </div>
+            </div>
+            <span class="text-[10px] font-mono text-slate-400 mt-1 font-semibold">CORE 1 (Audio DMA)</span>
+          </div>
+        </div>
+        <div class="flex justify-between text-[10px] font-mono text-slate-400 border-t border-white/5 pt-1">
+          <span>CLOCK: <strong class="text-slate-200">240 MHz</strong></span>
+          <span>TEMP: <strong id="val-temp" class="text-amber-400">-- &deg;C</strong></span>
+        </div>
+      </div>
+
+      <!-- Card 3: RAM & Heap Allocation -->
+      <div class="glass-panel p-4 flex flex-col justify-between space-y-2">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span class="font-medium tracking-wide">RAM / HEAP USAGE</span>
+          <span class="font-mono text-emerald-400 text-[10px] bg-emerald-950/50 px-1.5 py-0.5 rounded border border-emerald-800">SRAM + PSRAM</span>
+        </div>
+        <div class="flex items-center space-x-4">
+          <div class="relative w-18 h-18 flex items-center justify-center shrink-0">
+            <svg class="w-16 h-16 gauge-svg" viewBox="0 0 88 88">
+              <circle class="gauge-bg" cx="44" cy="44" r="38" stroke-width="7" fill="none"/>
+              <circle id="gauge-sram" class="gauge-progress" cx="44" cy="44" r="38" stroke="#10b981" stroke-width="7" fill="none" stroke-dasharray="238.76" stroke-dashoffset="238.76"/>
+            </svg>
+            <div class="absolute text-center">
+              <span id="val-sram-pct" class="text-xs font-bold font-mono text-emerald-300">--%</span>
+            </div>
+          </div>
+          <div class="space-y-0.5 text-[11px] font-mono text-slate-300 flex-1">
+            <div class="flex justify-between">
+              <span class="text-slate-400">Used SRAM:</span>
+              <strong id="val-sram-used">-- KB</strong>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">Free Heap:</span>
+              <strong id="val-sram-free" class="text-emerald-400">-- KB</strong>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-slate-400">Min Watermark:</span>
+              <strong id="val-sram-min" class="text-amber-400">-- KB</strong>
+            </div>
+          </div>
+        </div>
+        <div id="psram-panel" class="border-t border-white/5 pt-1 text-[10px] font-mono flex justify-between text-slate-400">
+          <span>PSRAM FREE:</span>
+          <strong id="val-psram-free" class="text-slate-200">--</strong>
+        </div>
+      </div>
+
+      <!-- Card 4: Audio Pipeline & Voice Detection -->
+      <div class="glass-panel p-4 flex flex-col justify-between space-y-2">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span class="font-medium tracking-wide">AUDIO LEVEL & VAD</span>
+          <span id="vad-indicator" class="vad-badge text-[10px] font-mono px-2 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-400 uppercase font-semibold">
+            NO DATA
+          </span>
+        </div>
+        <div class="space-y-1.5">
+          <div class="flex justify-between items-baseline">
+            <span class="text-[11px] font-mono text-slate-400">LIVE MIC LEVEL:</span>
+            <span id="val-dbfs" class="text-lg font-bold font-mono text-cyan-300">-- dBFS</span>
+          </div>
+          <div class="w-full h-3 bg-slate-950 rounded-full overflow-hidden border border-white/10 p-0.5">
+            <div id="db-meter-bar" class="h-full bg-gradient-to-r from-emerald-500 via-cyan-400 to-rose-500 rounded-full transition-all duration-75" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="border-t border-white/5 pt-1.5 flex justify-between text-[10px] font-mono text-slate-400">
+          <span>FORMAT: <strong class="text-slate-200">16kHz 16-bit Mono</strong></span>
+          <span>NYQUIST: <strong class="text-cyan-400">8.0 kHz</strong></span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Main Spectrogram & Scope Center Stage -->
+    <div class="glass-panel p-4 space-y-4">
+      
+      <!-- Spectrogram Controls Bar -->
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+        <div class="flex items-center space-x-2">
+          <span class="w-2.5 h-2.5 rounded-sm bg-cyan-400 shadow-[0_0_8px_#00f0ff]"></span>
+          <h2 class="text-sm font-bold tracking-wider uppercase text-white">Live Voice Spectrogram (Waterfall)</h2>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-4 text-xs">
+          <!-- Colormap Picker -->
+          <div class="flex items-center space-x-2">
+            <label class="text-slate-400 font-mono">Palette:</label>
+            <select id="select-palette" class="bg-slate-900 border border-slate-700 text-slate-200 rounded px-2.5 py-1 text-xs font-mono">
+              <option value="cyberpunk">Cyberpunk Neon</option>
+              <option value="inferno">Inferno Thermal</option>
+              <option value="viridis">Viridis Standard</option>
+              <option value="magma">Magma</option>
+              <option value="turbo">Turbo Rainbow</option>
+            </select>
+          </div>
+
+          <!-- FFT Size Picker -->
+          <div class="flex items-center space-x-2">
+            <label class="text-slate-400 font-mono">FFT Size:</label>
+            <select id="select-fft" class="bg-slate-900 border border-slate-700 text-slate-200 rounded px-2.5 py-1 text-xs font-mono">
+              <option value="512">512 Bins</option>
+              <option value="1024" selected>1024 Bins (Hi-Res)</option>
+              <option value="2048">2048 Bins (Ultra-Res)</option>
+            </select>
+          </div>
+
+          <!-- Gain Slider -->
+          <div class="flex items-center space-x-2">
+            <label class="text-slate-400 font-mono">Gain:</label>
+            <input type="range" id="slider-gain" min="0.5" max="3.0" step="0.1" value="1.2" class="w-20">
+            <span id="val-gain" class="font-mono text-slate-300 w-8">1.2x</span>
+          </div>
+
+          <!-- Audio Monitor Toggle -->
+          <div class="flex items-center space-x-2 bg-slate-900 border border-slate-700 px-2.5 py-1 rounded-lg">
+            <input type="checkbox" id="toggle-listen" class="accent-cyan-400 cursor-pointer">
+            <label for="toggle-listen" class="text-slate-300 font-mono cursor-pointer select-none">Listen to Audio</label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Spectrogram Canvas with Frequency Axis -->
+      <div class="canvas-container relative">
+        <canvas id="spectrogram-canvas" class="spectrogram-canvas" height="300"></canvas>
+        
+        <div class="freq-axis">
+          <span>8.0 kHz</span>
+          <span>6.0 kHz</span>
+          <span>4.0 kHz</span>
+          <span>2.0 kHz</span>
+          <span>1.0 kHz</span>
+          <span>0 Hz</span>
+        </div>
+
+        <div id="spectrogram-tooltip" class="absolute pointer-events-none hidden bg-slate-900/90 border border-cyan-500/40 text-cyan-300 text-xs px-2 py-1 rounded shadow-lg font-mono z-20">
+        </div>
+      </div>
+
+      <!-- Time-Domain Oscilloscope Waveform -->
+      <div class="space-y-1.5 pt-2">
+        <div class="flex justify-between items-center text-xs text-slate-400">
+          <span class="font-mono tracking-wide flex items-center space-x-1.5">
+            <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+            <span>TIME-DOMAIN PCM WAVEFORM (OSCILLOSCOPE)</span>
+          </span>
+          <span class="font-mono text-[10px] text-slate-500">16-BIT PCM CHUNKS</span>
+        </div>
+        <div class="canvas-container">
+          <canvas id="scope-canvas" class="scope-canvas" height="90"></canvas>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Wake Word & Speech Transcript -->
+    <section id="transcript-panel" class="glass-panel p-4 space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+        <div class="flex items-center space-x-2">
+          <div class="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/30 flex items-center justify-center text-purple-300">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18.5a6.5 6.5 0 0 0 6.5-6.5v-1m-13 0v1A6.5 6.5 0 0 0 12 18.5Zm0 0V22m-3 0h6M12 15a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v7a3 3 0 0 0 3 3Z"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-sm font-bold tracking-wider uppercase text-white">Wake Word / Speech Transcript</h2>
+            <p class="text-[10px] font-mono text-slate-500">Text recognized after wake-word detection</p>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <span id="wake-status" class="wake-status text-[10px] font-mono px-2.5 py-1 rounded-full border border-slate-700 bg-slate-800 text-slate-400 uppercase font-semibold">
+            WAITING FOR WAKE WORD
+          </span>
+          <button id="btn-clear-transcript" class="text-[10px] font-mono px-2.5 py-1 rounded border border-slate-700 bg-slate-900 text-slate-300 hover:border-cyan-500/60 hover:text-cyan-300 transition">
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <div class="transcript-box rounded-lg bg-slate-950/70 border border-white/10 p-4">
+        <p id="transcript-text" class="text-base md:text-lg leading-relaxed text-slate-400">
+          Waiting for wake word detection...
+        </p>
+      </div>
+
+      <div class="flex flex-wrap justify-between gap-2 text-[10px] font-mono text-slate-500">
+        <span>STT SOURCE: <strong class="text-slate-300">Backend / Whisper transcript event</strong></span>
+        <span>LAST UPDATE: <strong id="transcript-time" class="text-cyan-400">--:--:--</strong></span>
+      </div>
+    </section>
+
+    <!-- Bottom Info Bar -->
+    <footer class="glass-panel p-3 text-xs text-slate-400 flex flex-wrap justify-between items-center gap-3 font-mono">
+      <div class="flex items-center space-x-4">
+        <span>DEVICE: <strong class="text-slate-200">ESP32-S3-WROOM-1 / N8R8</strong></span>
+        <span>RSSI: <strong id="val-rssi" class="text-emerald-400">-- dBm</strong></span>
+        <span>PACKETS: <strong id="val-packets" class="text-cyan-400">0</strong></span>
+      </div>
+      <div class="flex items-center space-x-4">
+        <span>UPTIME: <strong id="val-uptime" class="text-slate-200">--:--:--</strong></span>
+        <span class="text-slate-500">|</span>
+        <span class="text-slate-400">Browser Web Audio + HTML5 Canvas</span>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- EMBEDDED JAVASCRIPT ENGINES -->
+  <script>
+    /* ==========================================================================
+       SPECTROGRAM & OSCILLOSCOPE RENDERER
+       ========================================================================== */
+    class SpectrogramRenderer {
+      constructor(canvasId, options = {}) {
+        this.canvas = document.getElementById(canvasId);
+        if (!this.canvas) return;
+        this.ctx = this.canvas.getContext('2d', { alpha: false });
+        this.sampleRate = options.sampleRate || 16000;
+        this.nyquist = this.sampleRate / 2;
+        this.speed = options.speed || 2;
+        this.currentPalette = options.palette || 'cyberpunk';
+        this.gain = options.gain || 1.2;
+
+        this.luts = {
+          inferno: this._genInferno(),
+          viridis: this._genViridis(),
+          cyberpunk: this._genCyberpunk(),
+          magma: this._genMagma(),
+          turbo: this._genTurbo()
+        };
+
+        this.initCanvasSize();
+        window.addEventListener('resize', () => this.initCanvasSize());
+        this._initHover();
+      }
+
+      initCanvasSize() {
+        if (!this.canvas) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        this.width = Math.floor(rect.width * dpr) || 800;
+        this.height = Math.floor(rect.height * dpr) || 300;
+        this.canvas.width = this.width;
+        this.canvas.height = this.height;
+        this.ctx.fillStyle = '#05070a';
+        this.ctx.fillRect(0, 0, this.width, this.height);
+        this.columnImg = this.ctx.createImageData(this.speed, this.height);
+      }
+
+      setPalette(name) { if (this.luts[name]) this.currentPalette = name; }
+      setGain(g) { this.gain = g; }
+
+      addSlice(freqData) {
+        if (!freqData || !this.ctx) return;
+        const w = this.width, h = this.height, speed = this.speed;
+        const lut = this.luts[this.currentPalette] || this.luts.cyberpunk;
+
+        // Shift left
+        this.ctx.drawImage(this.canvas, speed, 0, w - speed, h, 0, 0, w - speed, h);
+
+        const binCount = freqData.length;
+        const img = this.columnImg.data;
+
+        for (let y = 0; y < h; y++) {
+          const binIdx = Math.floor(((h - 1 - y) / h) * binCount);
+          let val = Math.min(255, Math.floor((freqData[binIdx] || 0) * this.gain));
+          const idx = val * 3;
+          const r = lut[idx], g = lut[idx + 1], b = lut[idx + 2];
+
+          for (let s = 0; s < speed; s++) {
+            const p = (y * speed + s) * 4;
+            img[p] = r; img[p + 1] = g; img[p + 2] = b; img[p + 3] = 255;
+          }
+        }
+        this.ctx.putImageData(this.columnImg, w - speed, 0);
+      }
+
+      _initHover() {
+        this.canvas.addEventListener('mousemove', (e) => {
+          const rect = this.canvas.getBoundingClientRect();
+          const y = e.clientY - rect.top;
+          const freqHz = Math.round((1.0 - (y / rect.height)) * this.nyquist);
+          const tooltip = document.getElementById('spectrogram-tooltip');
+          if (tooltip) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = `${Math.min(rect.width - 130, Math.max(10, e.clientX - rect.left + 15))}px`;
+            tooltip.style.top = `${Math.min(rect.height - 40, Math.max(10, y - 30))}px`;
+            tooltip.innerHTML = `<strong>${freqHz.toLocaleString()} Hz</strong>`;
+          }
+        });
+        this.canvas.addEventListener('mouseleave', () => {
+          const t = document.getElementById('spectrogram-tooltip');
+          if (t) t.style.display = 'none';
+        });
+      }
+
+      _genCyberpunk() {
+        const lut = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          let r=0, g=0, b=0;
+          if (t < 0.25) { const f = t/0.25; r = 10*(1-f); g = 180*f; b = 40*(1-f) + 255*f; }
+          else if (t < 0.6) { const f = (t-0.25)/0.35; r = 244*f; g = 180*(1-f) + 63*f; b = 255; }
+          else if (t < 0.85) { const f = (t-0.6)/0.25; r = 244 + 11*f; g = 63*(1-f) + 180*f; b = 255*(1-f) + 50*f; }
+          else { const f = (t-0.85)/0.15; r = 255; g = 180 + 75*f; b = 50 + 205*f; }
+          lut[i*3] = Math.min(255, r); lut[i*3+1] = Math.min(255, g); lut[i*3+2] = Math.min(255, b);
+        }
+        return lut;
+      }
+      _genInferno() {
+        const lut = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          lut[i*3] = Math.min(255, Math.floor(255 * (t < 0.33 ? t*2.5 : t < 0.66 ? 0.8+(t-0.33)*0.5 : 1.0)));
+          lut[i*3+1] = Math.min(255, Math.floor(255 * (t < 0.33 ? 0 : t < 0.66 ? (t-0.33)*2.2 : 0.72+(t-0.66)*0.8)));
+          lut[i*3+2] = Math.min(255, Math.floor(255 * (t < 0.25 ? t*3.5 : t < 0.5 ? 0.87-(t-0.25)*2.5 : 0)));
+        }
+        return lut;
+      }
+      _genViridis() {
+        const lut = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          lut[i*3] = Math.min(255, Math.floor(255 * (t < 0.5 ? 0.27+t*0.1 : 0.32+(t-0.5)*1.3)));
+          lut[i*3+1] = Math.min(255, Math.floor(255 * (t < 0.4 ? t*1.5 : 0.6+(t-0.4)*0.65)));
+          lut[i*3+2] = Math.min(255, Math.floor(255 * (t < 0.3 ? 0.33+t*1.8 : 0.87-(t-0.3)*1.0)));
+        }
+        return lut;
+      }
+      _genMagma() {
+        const lut = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          lut[i*3] = Math.min(255, Math.floor(255 * (t < 0.3 ? t*1.6 : 0.48+(t-0.3)*0.74)));
+          lut[i*3+1] = Math.min(255, Math.floor(255 * (t < 0.4 ? 0 : t < 0.7 ? (t-0.4)*1.5 : 0.45+(t-0.7)*1.8)));
+          lut[i*3+2] = Math.min(255, Math.floor(255 * (t < 0.2 ? 0.15+t*2.0 : 0.55)));
+        }
+        return lut;
+      }
+      _genTurbo() {
+        const lut = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          lut[i*3] = Math.min(255, Math.floor(255 * Math.sin(t * Math.PI * 0.7)));
+          lut[i*3+1] = Math.min(255, Math.floor(255 * Math.sin(t * Math.PI)));
+          lut[i*3+2] = Math.min(255, Math.floor(255 * Math.cos(t * Math.PI * 0.5)));
+        }
+        return lut;
+      }
+    }
+
+    class OscilloscopeRenderer {
+      constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        if (!this.canvas) return;
+        this.ctx = this.canvas.getContext('2d');
+        this.initCanvasSize();
+        window.addEventListener('resize', () => this.initCanvasSize());
+      }
+      initCanvasSize() {
+        if (!this.canvas) return;
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        this.width = Math.floor(rect.width * dpr) || 800;
+        this.height = Math.floor(rect.height * dpr) || 90;
+        this.canvas.width = this.width;
+        this.canvas.height = this.height;
+      }
+      draw(timeData) {
+        if (!timeData || !this.ctx) return;
+        const w = this.width, h = this.height, ctx = this.ctx;
+        ctx.fillStyle = '#080b11';
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#00f0ff';
+        ctx.shadowColor = 'rgba(0, 240, 255, 0.6)';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        const slice = w / timeData.length;
+        let x = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const y = ((timeData[i] / 128.0) * h) / 2;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          x += slice;
+        }
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+    }
+
+    /* ==========================================================================
+       AUDIO PROCESSOR & DSP
+       ========================================================================== */
+    class AudioProcessor {
+      constructor(options = {}) {
+        this.sampleRate = options.sampleRate || 16000;
+        this.fftSize = options.fftSize || 1024;
+        this.isMuted = true;
+        this.gain = 1.0;
+        this.audioCtx = null;
+        this.analyser = null;
+        this.gainNode = null;
+        this.freqData = new Uint8Array(this.fftSize / 2);
+        this.timeData = new Uint8Array(this.fftSize);
+        this.timeData.fill(128);
+        this.currentDb = -100;
+        this.isVoiceActive = false;
+        this.syntheticMode = false;
+        this.nextAudioTime = 0;
+      }
+
+      async initAudioContext() {
+        try {
+          if (!this.audioCtx) {
+            const Cls = window.AudioContext || window.webkitAudioContext;
+            if (!Cls) return false;
+            this.audioCtx = new Cls({ sampleRate: this.sampleRate });
+            this.analyser = this.audioCtx.createAnalyser();
+            this.analyser.fftSize = this.fftSize;
+            this.analyser.smoothingTimeConstant = 0.55;
+            this.gainNode = this.audioCtx.createGain();
+            this.gainNode.gain.value = this.isMuted ? 0 : this.gain;
+            this.analyser.connect(this.gainNode);
+            this.gainNode.connect(this.audioCtx.destination);
+          }
+          if (this.audioCtx.state === 'suspended') {
+            await this.audioCtx.resume();
+          }
+          return this.audioCtx.state === 'running';
+        } catch (e) {
+          console.warn('AudioContext init failed:', e);
+          return false;
+        }
+      }
+
+      setSyntheticMode(enabled) {
+        this.syntheticMode = enabled;
+      }
+
+      reset() {
+        this.freqData = new Uint8Array(this.fftSize / 2);
+        this.timeData = new Uint8Array(this.fftSize);
+        this.timeData.fill(128);
+        this.currentDb = -100;
+        this.isVoiceActive = false;
+        this.nextAudioTime = 0;
+      }
+
+      setFftSize(sz) {
+        this.fftSize = sz;
+        if (this.analyser) {
+          this.analyser.fftSize = sz;
+          this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
+          this.timeData = new Uint8Array(this.analyser.fftSize);
+          this.timeData.fill(128);
+        } else {
+          this.freqData = new Uint8Array(sz / 2);
+          this.timeData = new Uint8Array(sz);
+          this.timeData.fill(128);
+        }
+      }
+
+      setMute(m) {
+        this.isMuted = m;
+        if (this.gainNode && this.audioCtx) {
+          this.gainNode.gain.setValueAtTime(m ? 0 : this.gain, this.audioCtx.currentTime);
+        }
+      }
+
+      processPcmChunk(buf) {
+        let int16;
+        if (buf instanceof Int16Array) {
+          int16 = buf;
+        } else if (buf instanceof ArrayBuffer) {
+          if (buf.byteLength < 2) return;
+          int16 = new Int16Array(buf, 0, Math.floor(buf.byteLength / 2));
+        } else if (ArrayBuffer.isView(buf)) {
+          if (buf.byteLength < 2) return;
+          int16 = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 2));
+        } else {
+          return;
+        }
+
+        if (!int16.length) return;
+
+        let sum = 0;
+        for (let i = 0; i < int16.length; i++) {
+          const n = int16[i] / 32768.0;
+          sum += n * n;
+        }
+        const rms = Math.sqrt(sum / int16.length);
+        this.currentDb = rms > 1e-5 ? 20 * Math.log10(rms) : -100;
+        this.isVoiceActive = this.currentDb > -45;
+
+        // Always feed real PCM into the analyser. The downstream gain node is
+        // set to 0 while "Listen to Audio" is disabled, so analysis still works
+        // without playing sound through the speakers.
+        if (this.audioCtx && this.audioCtx.state === 'running' && this.analyser) {
+          const flt = new Float32Array(int16.length);
+          for (let i = 0; i < int16.length; i++) flt[i] = int16[i] / 32768.0;
+
+          const ab = this.audioCtx.createBuffer(1, flt.length, this.sampleRate);
+          ab.copyToChannel(flt, 0);
+          const src = this.audioCtx.createBufferSource();
+          src.buffer = ab;
+          src.connect(this.analyser);
+
+          const now = this.audioCtx.currentTime;
+          if (!this.nextAudioTime || this.nextAudioTime < now || this.nextAudioTime > now + 0.5) {
+            this.nextAudioTime = now;
+          }
+          src.start(this.nextAudioTime);
+          this.nextAudioTime += flt.length / this.sampleRate;
+        }
+      }
+
+      getAnalysisData() {
+        if (!this.syntheticMode && this.analyser) {
+          this.analyser.getByteFrequencyData(this.freqData);
+          this.analyser.getByteTimeDomainData(this.timeData);
+        }
+        return {
+          freqData: this.freqData,
+          timeData: this.timeData,
+          db: this.currentDb,
+          isVoiceActive: this.isVoiceActive
+        };
+      }
+    }
+
+    /* ==========================================================================
+       TELEMETRY & HARDWARE MANAGER
+       ========================================================================== */
+    class TelemetryManager {
+      constructor(audioProc, spec, scope) {
+        this.audioProc = audioProc;
+        this.spec = spec;
+        this.scope = scope;
+
+        this.isConnected = false;
+        this.mode = 'serial';
+        this.ws = null;
+        this.serialPort = null;
+        this.serialReader = null;
+        this.serialReadToken = 0;
+        this.serialBuffer = new Uint8Array(0);
+        this.textDecoder = new TextDecoder();
+
+        this.packetsReceived = 0;
+        this.latencyHistory = [];
+        this.metrics = this._emptyMetrics();
+        this.lastTranscript = '';
+        this.transcriptFinal = false;
+
+        this.sparkline = document.getElementById('latency-sparkline');
+        if (this.sparkline) this.spCtx = this.sparkline.getContext('2d');
+
+        this._resetDashboard(false);
+        this._updateStatus('disconnected', 'USB Not Connected');
+        this._setupLoop();
+      }
+
+      _emptyMetrics() {
+        return {
+          latency: null,
+          minLatency: null,
+          maxLatency: null,
+          avgLatency: null,
+          jitter: null,
+          cpu0: null,
+          cpu1: null,
+          heapFree: null,
+          heapTotal: null,
+          heapMinFree: null,
+          psramFree: null,
+          psramTotal: null,
+          rssi: null,
+          temp: null,
+          uptimeSec: null
+        };
+      }
+
+      async connectWebSocket(url) {
+        await this.disconnect(false);
+        this.mode = 'ws';
+        this.audioProc.setSyntheticMode(false);
+        this._resetDashboard(false);
+        this._updateStatus('connecting', `Connecting to ${url}...`);
+
+        try {
+          const ws = new WebSocket(url);
+          this.ws = ws;
+          ws.binaryType = 'arraybuffer';
+
+          ws.onopen = async () => {
+            if (this.ws !== ws) return;
+            this.isConnected = true;
+            this._updateStatus('connected', `Connected: ${url}`);
+            this._updateConnectionButtons();
+            await this.audioProc.initAudioContext();
+
+            this.pingTimer = setInterval(() => {
+              if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+                try {
+                  ws.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+                } catch (_) {}
+              }
+            }, 1000);
+          };
+
+          ws.onmessage = (e) => {
+            if (this.ws !== ws) return;
+            this.packetsReceived++;
+            this._setTxt('val-packets', String(this.packetsReceived));
+
+            if (e.data instanceof ArrayBuffer) {
+              this.audioProc.processPcmChunk(e.data);
+            } else if (typeof e.data === 'string') {
+              this._handleTextMessage(e.data);
+            } else if (e.data instanceof Blob) {
+              e.data.arrayBuffer().then((buf) => this.audioProc.processPcmChunk(buf)).catch(() => {});
+            }
+          };
+
+          ws.onclose = () => {
+            if (this.ws !== ws) return;
+            this.ws = null;
+            this.isConnected = false;
+            if (this.pingTimer) clearInterval(this.pingTimer);
+            this.pingTimer = null;
+            this._updateStatus('disconnected', 'WebSocket Disconnected');
+            this._updateConnectionButtons();
+          };
+
+          ws.onerror = () => {
+            if (this.ws !== ws) return;
+            this._updateStatus('error', 'WebSocket Connection Error');
+          };
+        } catch (e) {
+          this.ws = null;
+          this.isConnected = false;
+          this._updateStatus('error', e.message || 'WebSocket connection failed');
+          this._updateConnectionButtons();
+        }
+      }
+
+      async connectSerial(baudRate) {
+        await this.disconnect(false);
+        this.mode = 'serial';
+        this.audioProc.setSyntheticMode(false);
+        this._resetDashboard(false);
+
+        if (!('serial' in navigator)) {
+          this._updateStatus('error', 'WebSerial is not supported. Use Chrome or Edge.');
+          return;
+        }
+        if (!window.isSecureContext) {
+          this._updateStatus('error', 'WebSerial requires HTTPS or localhost.');
+          return;
+        }
+
+        this._updateStatus('connecting', 'Select your ESP32-S3 serial port...');
+
+        try {
+          const port = await navigator.serial.requestPort();
+          await port.open({ baudRate, bufferSize: 65536 });
+
+          this.serialPort = port;
+          this.serialBuffer = new Uint8Array(0);
+          this.serialReadToken++;
+          const token = this.serialReadToken;
+
+          this.isConnected = true;
+          this._updateStatus('connected', `ESP32-S3 USB Connected @ ${baudRate} baud`);
+          this._updateConnectionButtons();
+          await this.audioProc.initAudioContext();
+
+          this._readSerialLoop(token).catch((e) => {
+            if (token !== this.serialReadToken) return;
+            console.error('Serial read error:', e);
+            this.isConnected = false;
+            this._updateStatus('error', `USB read error: ${e.message || e}`);
+            this._updateConnectionButtons();
+          });
+        } catch (e) {
+          this.serialPort = null;
+          this.serialReader = null;
+          this.isConnected = false;
+          const msg = e && e.name === 'NotFoundError'
+            ? 'USB connection cancelled'
+            : `USB connection failed: ${e.message || e}`;
+          this._updateStatus(e && e.name === 'NotFoundError' ? 'disconnected' : 'error', msg);
+          this._updateConnectionButtons();
+        }
+      }
+
+      async _readSerialLoop(token) {
+        const port = this.serialPort;
+        if (!port || !port.readable) throw new Error('Serial port is not readable');
+
+        const reader = port.readable.getReader();
+        this.serialReader = reader;
+
+        try {
+          while (token === this.serialReadToken && this.serialPort === port) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value || !value.byteLength) continue;
+
+            this._appendSerialBytes(value);
+            this._parseSerialBuffer();
+          }
+        } finally {
+          try { reader.releaseLock(); } catch (_) {}
+          if (this.serialReader === reader) this.serialReader = null;
+        }
+
+        if (token === this.serialReadToken && this.serialPort === port) {
+          this.isConnected = false;
+          this._updateStatus('disconnected', 'USB serial stream ended');
+          this._updateConnectionButtons();
+        }
+      }
+
+      _appendSerialBytes(chunk) {
+        const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        const merged = new Uint8Array(this.serialBuffer.length + incoming.length);
+        merged.set(this.serialBuffer, 0);
+        merged.set(incoming, this.serialBuffer.length);
+        this.serialBuffer = merged;
+      }
+
+      _parseSerialBuffer() {
+        // Supported USB serial formats:
+        // 1) Newline-delimited JSON (NDJSON), e.g. {"type":"telemetry",...}\n
+        // 2) Framed binary packets:
+        //      byte 0   = 0xA5
+        //      byte 1   = 0x5A
+        //      byte 2   = packet type (0x01 JSON, 0x02 PCM16-LE)
+        //      bytes 3-6 = uint32 little-endian payload length
+        //      bytes 7.. = payload
+        const MAGIC0 = 0xA5;
+        const MAGIC1 = 0x5A;
+        const HEADER = 7;
+        const MAX_PAYLOAD = 1024 * 1024;
+
+        while (this.serialBuffer.length) {
+          const b = this.serialBuffer;
+
+          if (b.length >= 2 && b[0] === MAGIC0 && b[1] === MAGIC1) {
+            if (b.length < HEADER) return;
+            const len = (b[3] | (b[4] << 8) | (b[5] << 16) | (b[6] << 24)) >>> 0;
+            if (len > MAX_PAYLOAD) {
+              console.warn('Dropping invalid serial frame length:', len);
+              this.serialBuffer = b.slice(1);
+              continue;
+            }
+            if (b.length < HEADER + len) return;
+
+            const type = b[2];
+            const payload = b.slice(HEADER, HEADER + len);
+            this.serialBuffer = b.slice(HEADER + len);
+            this._handleSerialFrame(type, payload);
+            continue;
+          }
+
+          let newline = -1;
+          let magic = -1;
+          for (let i = 0; i < b.length; i++) {
+            if (b[i] === 0x0A) { newline = i; break; }
+          }
+          for (let i = 1; i + 1 < b.length; i++) {
+            if (b[i] === MAGIC0 && b[i + 1] === MAGIC1) { magic = i; break; }
+          }
+
+          if (magic > 0 && (newline < 0 || magic < newline)) {
+            const prefix = b.slice(0, magic);
+            this.serialBuffer = b.slice(magic);
+            const text = this.textDecoder.decode(prefix).trim();
+            if (text) this._handleTextMessage(text);
+            continue;
+          }
+
+          if (newline >= 0) {
+            const lineBytes = b.slice(0, newline);
+            this.serialBuffer = b.slice(newline + 1);
+            let line = this.textDecoder.decode(lineBytes).replace(/\r$/, '').trim();
+            if (line) {
+              this.packetsReceived++;
+              this._setTxt('val-packets', String(this.packetsReceived));
+              this._handleTextMessage(line);
+            }
+            continue;
+          }
+
+          // Prevent an endless memory build-up if the device is sending an
+          // unsupported protocol with no newline or frame marker.
+          if (b.length > 65536) {
+            console.warn('Serial buffer overflow: unsupported/unframed data was discarded');
+            this.serialBuffer = new Uint8Array(0);
+          }
+          return;
+        }
+      }
+
+      _handleSerialFrame(type, payload) {
+        this.packetsReceived++;
+        this._setTxt('val-packets', String(this.packetsReceived));
+
+        if (type === 0x01) {
+          const text = this.textDecoder.decode(payload).trim();
+          if (text) this._handleTextMessage(text);
+        } else if (type === 0x02) {
+          if (payload.byteLength >= 2) {
+            const evenLength = payload.byteLength - (payload.byteLength % 2);
+            const copy = payload.slice(0, evenLength);
+            this.audioProc.processPcmChunk(copy.buffer);
+          }
+        } else {
+          console.warn('Unknown serial packet type:', type);
+        }
+      }
+
+      _handleTextMessage(text) {
+        try {
+          const d = JSON.parse(text);
+          this._handleMessage(d);
+        } catch (_) {
+          // Normal ESP-IDF log lines are allowed on the serial port. They are
+          // ignored by the dashboard instead of being mistaken for telemetry.
+          console.debug('ESP32:', text);
+        }
+      }
+
+      _handleMessage(d) {
+        if (!d || typeof d !== 'object') return;
+
+        const eventName = String(d.event ?? d.type ?? '').toLowerCase();
+
+        if (d.type === 'pong' && Number.isFinite(Number(d.t))) {
+          this._recordLatency(performance.now() - Number(d.t));
+          return;
+        }
+
+        // Wake-word event from ESP32 / backend. Supported examples:
+        //   {"event":"wake_detected"}
+        //   {"type":"wake"}
+        if (['wake', 'wake_detected', 'wake-word', 'wake_word', 'wakeword'].includes(eventName)) {
+          this._setTranscriptStatus('wake', 'WAKE DETECTED — LISTENING');
+          this._setTranscriptText('Wake word detected. Listening for your command...', false);
+          return;
+        }
+
+        // Speech-to-text result from the backend / Whisper. Supported examples:
+        //   {"event":"transcript","text":"turn on the light","final":true}
+        //   {"type":"transcript","transcript":"what time is it"}
+        const transcriptValue = d.text ?? d.transcript ?? d.recognized_text ?? d.recognizedText;
+        if (eventName === 'transcript' || eventName === 'stt' || transcriptValue !== undefined) {
+          if (typeof transcriptValue === 'string' && transcriptValue.trim()) {
+            const isFinal = d.final ?? d.is_final ?? d.isFinal ?? true;
+            this._setTranscriptText(transcriptValue.trim(), Boolean(isFinal));
+          }
+          if (eventName === 'transcript' || eventName === 'stt') return;
+        }
+
+        if (d.type === 'audio' || d.event === 'audio') {
+          if (typeof d.pcm16_b64 === 'string') {
+            const pcm = this._base64ToInt16(d.pcm16_b64);
+            if (pcm) this.audioProc.processPcmChunk(pcm);
+          } else if (Array.isArray(d.pcm16)) {
+            const pcm = new Int16Array(d.pcm16.length);
+            for (let i = 0; i < d.pcm16.length; i++) pcm[i] = Number(d.pcm16[i]) || 0;
+            this.audioProc.processPcmChunk(pcm);
+          }
+          return;
+        }
+
+        this._handleTelem(d);
+      }
+
+      _setTranscriptText(text, isFinal = true) {
+        const cleaned = String(text ?? '').trim();
+        if (!cleaned) return;
+
+        this.lastTranscript = cleaned;
+        this.transcriptFinal = isFinal;
+
+        const el = document.getElementById('transcript-text');
+        if (el) {
+          el.textContent = cleaned;
+          el.className = isFinal
+            ? 'text-base md:text-lg leading-relaxed text-white'
+            : 'text-base md:text-lg leading-relaxed text-cyan-200';
+        }
+
+        const timeEl = document.getElementById('transcript-time');
+        if (timeEl) timeEl.textContent = new Date().toLocaleTimeString();
+
+        this._setTranscriptStatus(
+          isFinal ? 'ready' : 'listening',
+          isFinal ? 'TRANSCRIPT READY' : 'TRANSCRIBING...'
+        );
+      }
+
+      _setTranscriptStatus(state, label) {
+        const badge = document.getElementById('wake-status');
+        if (!badge) return;
+
+        const base = 'wake-status text-[10px] font-mono px-2.5 py-1 rounded-full border uppercase font-semibold';
+        if (state === 'wake' || state === 'listening') {
+          badge.className = `${base} border-cyan-500/50 bg-cyan-950/50 text-cyan-300 pulse-indicator`;
+        } else if (state === 'ready') {
+          badge.className = `${base} border-emerald-500/50 bg-emerald-950/50 text-emerald-300`;
+        } else {
+          badge.className = `${base} border-slate-700 bg-slate-800 text-slate-400`;
+        }
+        badge.textContent = label;
+      }
+
+      clearTranscript() {
+        this.lastTranscript = '';
+        this.transcriptFinal = false;
+        const el = document.getElementById('transcript-text');
+        if (el) {
+          el.textContent = 'Waiting for wake word detection...';
+          el.className = 'text-base md:text-lg leading-relaxed text-slate-400';
+        }
+        this._setTxt('transcript-time', '--:--:--');
+        this._setTranscriptStatus('waiting', 'WAITING FOR WAKE WORD');
+      }
+
+      _base64ToInt16(b64) {
+        try {
+          const raw = atob(b64);
+          const len = raw.length - (raw.length % 2);
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i);
+          return new Int16Array(bytes.buffer);
+        } catch (e) {
+          console.warn('Invalid base64 PCM:', e);
+          return null;
+        }
+      }
+
+      async startSimulation() {
+        await this.disconnect(false);
+        this._resetDashboard(false);
+        this.mode = 'sim';
+          this.isConnected = true;
+          this.audioProc.reset();
+          this.audioProc.setSyntheticMode(true);
+          this.packetsReceived = 0;
+          this.latencyHistory = [];
+          this.metrics = {
+            latency: 18.4, minLatency: 18.4, maxLatency: 18.4, avgLatency: 18.4, jitter: 0,
+            cpu0: 25.4, cpu1: 51.2,
+            heapFree: 284500, heapTotal: 327680, heapMinFree: 246100,
+            psramFree: 6842000, psramTotal: 8388608,
+            rssi: -58, temp: 42.5, uptimeSec: 0
+          };
+
+          this._updateStatus('simulating', 'DEMO MODE — Synthetic Data');
+          this._updateConnectionButtons();
+          this._updateDom();
+
+          let t = 0;
+          let isSpeaking = true;
+
+          this.simAudioTimer = setInterval(() => {
+            t += 0.032;
+            if (t > 3.0) t = 0;
+            isSpeaking = t < 2.2;
+
+            const p = this.audioProc.freqData;
+            const w = this.audioProc.timeData;
+
+            for (let i = 0; i < p.length; i++) {
+              if (isSpeaking) {
+                const f = (i / p.length) * 8000;
+                const energy = Math.exp(-Math.pow(f - 300, 2) / 30000) * 200 +
+                               Math.exp(-Math.pow(f - 850, 2) / 40000) * 160 +
+                               Math.exp(-Math.pow(f - 1900, 2) / 60000) * 120 +
+                               Math.random() * 20;
+                p[i] = Math.min(255, Math.floor(energy));
+              } else {
+                p[i] = Math.floor(Math.random() * 15);
+              }
+            }
+
+            for (let i = 0; i < w.length; i++) {
+              w[i] = isSpeaking
+                ? 128 + Math.floor(Math.sin(i * 0.15 + t * 10) * 50 + Math.sin(i * 0.3) * 25)
+                : 128 + Math.floor((Math.random() - 0.5) * 6);
+            }
+
+            this.audioProc.currentDb = isSpeaking ? -22 + Math.sin(t * 4) * 6 : -85;
+            this.audioProc.isVoiceActive = isSpeaking;
+          }, 32);
+
+          this.simTelemTimer = setInterval(() => {
+            this.packetsReceived++;
+            this.metrics.uptimeSec = (this.metrics.uptimeSec || 0) + 1;
+            this.metrics.cpu0 = Math.round((22 + Math.sin(Date.now() * 0.001) * 8) * 10) / 10;
+            this.metrics.cpu1 = isSpeaking ? Math.round((48 + Math.random() * 16) * 10) / 10 : 18.2;
+            this.metrics.temp = Math.round((42.5 + Math.sin(Date.now() * 0.0005) * 1.5) * 10) / 10;
+            const lat = Math.round((16 + Math.random() * 6 + (Math.random() > 0.9 ? 12 : 0)) * 10) / 10;
+            this._recordLatency(lat);
+            this._updateDom();
+          }, 1000);
+      }
+
+      async disconnect(updateStatus = true) {
+        if (this.simAudioTimer) clearInterval(this.simAudioTimer);
+        if (this.simTelemTimer) clearInterval(this.simTelemTimer);
+        if (this.pingTimer) clearInterval(this.pingTimer);
+        this.simAudioTimer = null;
+        this.simTelemTimer = null;
+        this.pingTimer = null;
+
+        this.serialReadToken++;
+
+        if (this.ws) {
+          const ws = this.ws;
+          this.ws = null;
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onclose = null;
+          ws.onerror = null;
+          try { ws.close(); } catch (_) {}
+        }
+
+        if (this.serialReader) {
+          const reader = this.serialReader;
+          this.serialReader = null;
+          try { await reader.cancel(); } catch (_) {}
+          try { reader.releaseLock(); } catch (_) {}
+        }
+
+        if (this.serialPort) {
+          const port = this.serialPort;
+          this.serialPort = null;
+          try { await port.close(); } catch (_) {}
+        }
+
+        this.isConnected = false;
+        this.audioProc.setSyntheticMode(false);
+        this.audioProc.reset();
+        this.serialBuffer = new Uint8Array(0);
+
+        if (updateStatus) {
+          const msg = this.mode === 'ws' ? 'WebSocket Not Connected' :
+                      this.mode === 'sim' ? 'Demo Stopped' : 'USB Not Connected';
+          this._updateStatus('disconnected', msg);
+          this._updateConnectionButtons();
+          this._resetDashboard(false);
+        }
+      }
+
+      _recordLatency(lat) {
+        if (!Number.isFinite(lat) || lat < 0) return;
+        this.metrics.latency = lat;
+        this.latencyHistory.push(lat);
+        if (this.latencyHistory.length > 50) this.latencyHistory.shift();
+
+        this.metrics.minLatency = Math.min(...this.latencyHistory);
+        this.metrics.maxLatency = Math.max(...this.latencyHistory);
+        const sum = this.latencyHistory.reduce((a, b) => a + b, 0);
+        this.metrics.avgLatency = sum / this.latencyHistory.length;
+
+        if (this.latencyHistory.length >= 2) {
+          let diffSum = 0;
+          for (let i = 1; i < this.latencyHistory.length; i++) {
+            diffSum += Math.abs(this.latencyHistory[i] - this.latencyHistory[i - 1]);
+          }
+          this.metrics.jitter = diffSum / (this.latencyHistory.length - 1);
+        } else {
+          this.metrics.jitter = 0;
+        }
+
+        this._drawSparkline();
+      }
+
+      _drawSparkline() {
+        if (!this.spCtx) return;
+        const ctx = this.spCtx;
+        const w = this.sparkline.width;
+        const h = this.sparkline.height;
+        ctx.clearRect(0, 0, w, h);
+
+        if (this.latencyHistory.length < 2) return;
+
+        const min = Math.max(0, Math.min(...this.latencyHistory) - 4);
+        const max = Math.max(...this.latencyHistory) + 4;
+        const range = max - min || 1;
+        ctx.strokeStyle = '#00f0ff';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const step = w / (this.latencyHistory.length - 1);
+        for (let i = 0; i < this.latencyHistory.length; i++) {
+          const x = i * step;
+          const y = h - ((this.latencyHistory[i] - min) / range) * (h - 6) - 3;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      _handleTelem(d) {
+        const src = (d.telemetry && typeof d.telemetry === 'object') ? d.telemetry : d;
+
+        this._assignNumber('cpu0', src.cpu0);
+        this._assignNumber('cpu1', src.cpu1);
+        this._assignNumber('heapFree', src.heap_free ?? src.heapFree);
+        this._assignNumber('heapTotal', src.heap_total ?? src.heapTotal);
+        this._assignNumber('heapMinFree', src.heap_min ?? src.heapMinFree);
+        this._assignNumber('psramFree', src.psram_free ?? src.psramFree);
+        this._assignNumber('psramTotal', src.psram_total ?? src.psramTotal);
+        this._assignNumber('temp', src.temp ?? src.temperature);
+        this._assignNumber('rssi', src.rssi);
+
+        const uptimeMs = Number(src.uptime_ms ?? src.uptimeMs);
+        if (Number.isFinite(uptimeMs)) this.metrics.uptimeSec = Math.floor(uptimeMs / 1000);
+        const uptimeSec = Number(src.uptime_sec ?? src.uptimeSec);
+        if (Number.isFinite(uptimeSec)) this.metrics.uptimeSec = Math.floor(uptimeSec);
+
+        const directLatency = Number(src.latency_ms ?? src.latency);
+        if (Number.isFinite(directLatency)) this._recordLatency(directLatency);
+
+        this._updateDom();
+      }
+
+      _assignNumber(key, value) {
+        if (value === undefined || value === null || value === '') return;
+        const n = Number(value);
+        if (Number.isFinite(n)) this.metrics[key] = n;
+      }
+
+      _updateDom() {
+        const m = this.metrics;
+
+        this._setTxt('val-latency', this._fmt(m.latency, 1, ' ms'));
+        this._setTxt('val-latency-min', this._fmt(m.minLatency, 1, ' ms'));
+        this._setTxt('val-latency-avg', this._fmt(m.avgLatency, 1, ' ms'));
+        this._setTxt('val-latency-max', this._fmt(m.maxLatency, 1, ' ms'));
+        this._setTxt('val-jitter', m.jitter == null ? '±-- ms' : `±${m.jitter.toFixed(1)} ms`);
+
+        this._setTxt('val-cpu0', this._fmt(m.cpu0, 1, '%'));
+        this._setTxt('val-cpu1', this._fmt(m.cpu1, 1, '%'));
+        this._setGauge('gauge-cpu0', m.cpu0);
+        this._setGauge('gauge-cpu1', m.cpu1);
+
+        let sramUsed = null;
+        let sramPct = null;
+        if (m.heapTotal != null && m.heapFree != null && m.heapTotal > 0) {
+          sramUsed = Math.max(0, m.heapTotal - m.heapFree);
+          sramPct = (sramUsed / m.heapTotal) * 100;
+        }
+
+        this._setTxt('val-sram-pct', this._fmt(sramPct, 1, '%'));
+        this._setTxt('val-sram-used', sramUsed == null ? '-- KB' : `${(sramUsed / 1024).toFixed(1)} KB`);
+        this._setTxt('val-sram-free', m.heapFree == null ? '-- KB' : `${(m.heapFree / 1024).toFixed(1)} KB`);
+        this._setTxt('val-sram-min', m.heapMinFree == null ? '-- KB' : `${(m.heapMinFree / 1024).toFixed(1)} KB`);
+        this._setGauge('gauge-sram', sramPct);
+
+        this._setTxt('val-psram-free', m.psramFree == null
+          ? '--'
+          : `${(m.psramFree / (1024 * 1024)).toFixed(2)} MB${m.psramTotal != null ? ` / ${(m.psramTotal / (1024 * 1024)).toFixed(1)} MB` : ''}`);
+
+        this._setTxt('val-temp', this._fmt(m.temp, 1, ' °C'));
+        this._setTxt('val-rssi', m.rssi == null ? '-- dBm' : `${Math.round(m.rssi)} dBm`);
+        this._setTxt('val-packets', String(this.packetsReceived));
+
+        if (m.uptimeSec == null) {
+          this._setTxt('val-uptime', '--:--:--');
+        } else {
+          const h = Math.floor(m.uptimeSec / 3600);
+          const mn = Math.floor((m.uptimeSec % 3600) / 60);
+          const s = Math.floor(m.uptimeSec % 60);
+          this._setTxt('val-uptime', `${h.toString().padStart(2, '0')}:${mn.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`);
+        }
+      }
+
+      _fmt(v, digits, suffix) {
+        return v == null || !Number.isFinite(v) ? `--${suffix}` : `${v.toFixed(digits)}${suffix}`;
+      }
+
+      _resetDashboard(resetStatus = true) {
+        this.metrics = this._emptyMetrics();
+        this.packetsReceived = 0;
+        this.latencyHistory = [];
+        this.audioProc.reset();
+        this.clearTranscript();
+
+        this._setTxt('val-latency', '-- ms');
+        this._setTxt('val-latency-min', '-- ms');
+        this._setTxt('val-latency-avg', '-- ms');
+        this._setTxt('val-latency-max', '-- ms');
+        this._setTxt('val-jitter', '±-- ms');
+        this._setTxt('val-cpu0', '--%');
+        this._setTxt('val-cpu1', '--%');
+        this._setTxt('val-sram-pct', '--%');
+        this._setTxt('val-sram-used', '-- KB');
+        this._setTxt('val-sram-free', '-- KB');
+        this._setTxt('val-sram-min', '-- KB');
+        this._setTxt('val-psram-free', '--');
+        this._setTxt('val-temp', '-- °C');
+        this._setTxt('val-rssi', '-- dBm');
+        this._setTxt('val-packets', '0');
+        this._setTxt('val-uptime', '--:--:--');
+        this._setGauge('gauge-cpu0', null);
+        this._setGauge('gauge-cpu1', null);
+        this._setGauge('gauge-sram', null);
+
+        const vad = document.getElementById('vad-indicator');
+        if (vad) {
+          vad.classList.remove('vad-active');
+          vad.textContent = 'NO DATA';
+        }
+        this._setTxt('val-dbfs', '-- dBFS');
+        const dbBar = document.getElementById('db-meter-bar');
+        if (dbBar) dbBar.style.width = '0%';
+
+        if (this.spCtx && this.sparkline) {
+          this.spCtx.clearRect(0, 0, this.sparkline.width, this.sparkline.height);
+        }
+        this._clearAudioCanvases();
+
+        if (resetStatus) this._updateStatus('disconnected', 'Not Connected');
+      }
+
+      _clearAudioCanvases() {
+        if (this.spec && this.spec.ctx) {
+          this.spec.ctx.fillStyle = '#05070a';
+          this.spec.ctx.fillRect(0, 0, this.spec.width, this.spec.height);
+        }
+        if (this.scope && this.scope.ctx) {
+          this.scope.ctx.fillStyle = '#080b11';
+          this.scope.ctx.fillRect(0, 0, this.scope.width, this.scope.height);
+          this.scope.ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+          this.scope.ctx.lineWidth = 1;
+          this.scope.ctx.beginPath();
+          this.scope.ctx.moveTo(0, this.scope.height / 2);
+          this.scope.ctx.lineTo(this.scope.width, this.scope.height / 2);
+          this.scope.ctx.stroke();
+        }
+      }
+
+      _setGauge(id, pct) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const circ = 2 * Math.PI * 38;
+
+        if (pct == null || !Number.isFinite(pct)) {
+          el.style.strokeDashoffset = circ;
+          return;
+        }
+
+        const cl = Math.max(0, Math.min(100, pct));
+        el.style.strokeDashoffset = circ - (cl / 100) * circ;
+        if (cl > 85) el.style.stroke = '#f43f5e';
+        else if (cl > 70) el.style.stroke = '#f59e0b';
+        else el.style.stroke = id.includes('sram') ? '#10b981' : (id.includes('cpu1') ? '#8b5cf6' : '#00f0ff');
+      }
+
+      _setTxt(id, val) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = val;
+      }
+
+      _updateStatus(state, msg) {
+        const txt = document.getElementById('status-text');
+        const badge = document.getElementById('status-badge');
+        const led = document.getElementById('status-led');
+        if (txt) txt.textContent = msg;
+        if (!badge || !led) return;
+
+        const base = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-mono border';
+
+        if (state === 'connected') {
+          badge.className = `${base} bg-emerald-950/50 border-emerald-500/40 text-emerald-300`;
+          led.className = 'w-2 h-2 rounded-full bg-emerald-400 pulse-indicator';
+        } else if (state === 'simulating') {
+          badge.className = `${base} bg-amber-950/50 border-amber-500/50 text-amber-300`;
+          led.className = 'w-2 h-2 rounded-full bg-amber-400 pulse-indicator';
+        } else if (state === 'connecting') {
+          badge.className = `${base} bg-cyan-950/50 border-cyan-500/40 text-cyan-300`;
+          led.className = 'w-2 h-2 rounded-full bg-cyan-400 pulse-indicator';
+        } else {
+          badge.className = `${base} bg-rose-950/50 border-rose-500/40 text-rose-300`;
+          led.className = 'w-2 h-2 rounded-full bg-rose-400';
+        }
+      }
+
+      _updateConnectionButtons() {
+        const serialBtn = document.getElementById('btn-serial-connect');
+        const wsBtn = document.getElementById('btn-ws-connect');
+        if (serialBtn) serialBtn.textContent = this.isConnected && this.mode === 'serial' ? 'Disconnect USB' : 'Connect USB';
+        if (wsBtn) wsBtn.textContent = this.isConnected && this.mode === 'ws' ? 'Disconnect' : 'Connect';
+      }
+
+      _setupLoop() {
+        const render = () => {
+          if (this.isConnected) {
+            const { freqData, timeData, db, isVoiceActive } = this.audioProc.getAnalysisData();
+            if (freqData && freqData.length > 0) this.spec.addSlice(freqData);
+            if (timeData && timeData.length > 0) this.scope.draw(timeData);
+
+            const vad = document.getElementById('vad-indicator');
+            if (vad) {
+              if (isVoiceActive) {
+                vad.classList.add('vad-active');
+                vad.textContent = 'VOICE ACTIVE';
+              } else {
+                vad.classList.remove('vad-active');
+                vad.textContent = 'SILENCE / AMBIENT';
+              }
+            }
+
+            const dbEl = document.getElementById('val-dbfs');
+            if (dbEl) dbEl.textContent = `${db.toFixed(1)} dBFS`;
+            const dbBar = document.getElementById('db-meter-bar');
+            if (dbBar) {
+              const width = Math.max(0, Math.min(100, (db + 90) * (100 / 80)));
+              dbBar.style.width = `${width}%`;
+            }
+          }
+          requestAnimationFrame(render);
+        };
+        requestAnimationFrame(render);
+      }
+    }
+
+    
+// Initialize App
+    document.addEventListener('DOMContentLoaded', () => {
+      const audioProc = new AudioProcessor({ sampleRate: 16000, fftSize: 1024 });
+      const spec = new SpectrogramRenderer('spectrogram-canvas', { sampleRate: 16000, palette: 'cyberpunk', speed: 2, gain: 1.2 });
+      const scope = new OscilloscopeRenderer('scope-canvas');
+      const telemetry = new TelemetryManager(audioProc, spec, scope);
+
+      const modeSel = document.getElementById('mode-select');
+      const wsCtrl = document.getElementById('ws-controls');
+      const serCtrl = document.getElementById('serial-controls');
+      const simCtrl = document.getElementById('sim-controls');
+
+      function showOnly(mode) {
+        wsCtrl.classList.add('hidden');
+        wsCtrl.classList.remove('flex');
+        serCtrl.classList.add('hidden');
+        serCtrl.classList.remove('flex');
+        simCtrl.classList.add('hidden');
+        simCtrl.classList.remove('flex');
+
+        if (mode === 'ws') {
+          wsCtrl.classList.remove('hidden');
+          wsCtrl.classList.add('flex');
+        } else if (mode === 'serial') {
+          serCtrl.classList.remove('hidden');
+          serCtrl.classList.add('flex');
+        } else {
+          simCtrl.classList.remove('hidden');
+          simCtrl.classList.add('flex');
+        }
+      }
+
+      modeSel.addEventListener('change', async (e) => {
+        const mode = e.target.value;
+        await telemetry.disconnect(false);
+        telemetry.mode = mode;
+        telemetry._resetDashboard(false);
+        showOnly(mode);
+
+        if (mode === 'ws') {
+          telemetry._updateStatus('disconnected', 'WebSocket Not Connected');
+        } else if (mode === 'serial') {
+          telemetry._updateStatus('disconnected', 'USB Not Connected');
+        } else {
+          await telemetry.startSimulation();
+        }
+
+        telemetry._updateConnectionButtons();
+      });
+
+      document.getElementById('btn-ws-connect').addEventListener('click', async () => {
+        if (telemetry.isConnected && telemetry.mode === 'ws') {
+          await telemetry.disconnect(true);
+          return;
+        }
+        const url = document.getElementById('ws-url').value.trim();
+        if (url) await telemetry.connectWebSocket(url);
+      });
+
+      document.getElementById('btn-serial-connect').addEventListener('click', async () => {
+        if (telemetry.isConnected && telemetry.mode === 'serial') {
+          await telemetry.disconnect(true);
+          return;
+        }
+        const baud = parseInt(document.getElementById('serial-baud').value, 10);
+        await telemetry.connectSerial(baud);
+      });
+
+      document.getElementById('btn-sim-toggle').addEventListener('click', async () => {
+        await telemetry.startSimulation();
+      });
+
+      document.getElementById('btn-clear-transcript').addEventListener('click', () => {
+        telemetry.clearTranscript();
+      });
+
+      // Optional integration hook for testing from the browser console or another script:
+      // window.voiceDashboardTranscript('hello world', true);
+      window.voiceDashboardTranscript = (text, final = true) => {
+        telemetry._setTranscriptText(text, final);
+      };
+      window.voiceDashboardWakeDetected = () => {
+        telemetry._handleMessage({ event: 'wake_detected' });
+      };
+
+      document.getElementById('select-palette').addEventListener('change', (e) => {
+        spec.setPalette(e.target.value);
+      });
+
+      document.getElementById('select-fft').addEventListener('change', (e) => {
+        audioProc.setFftSize(parseInt(e.target.value, 10));
+      });
+
+      const gainSlider = document.getElementById('slider-gain');
+      const gainVal = document.getElementById('val-gain');
+      gainSlider.addEventListener('input', (e) => {
+        gainVal.textContent = `${parseFloat(e.target.value).toFixed(1)}x`;
+        spec.setGain(parseFloat(e.target.value));
+      });
+
+      document.getElementById('toggle-listen').addEventListener('change', async (e) => {
+        await audioProc.initAudioContext();
+        audioProc.setMute(!e.target.checked);
+      });
+
+      // Truthful initial state: USB mode selected, but no device is connected.
+      showOnly('serial');
+      telemetry._updateConnectionButtons();
+
+      // Trigger button helper
+      window.triggerESP = async function() {
+        try {
+          await fetch('/api/trigger', { method: 'POST' });
+        } catch (e) {
+          console.error('Trigger request error:', e);
+        }
+      };
+
+      // Automatic FastAPI Backend Telemetry, Audio, and Whisper Bridge
+      function initBackendStream() {
+        const evtSource = new EventSource('/events');
+
+        evtSource.onopen = () => {
+          telemetry.isConnected = true;
+          telemetry._updateStatus('connected', 'Live Backend & ESP32 Connected');
+        };
+
+        evtSource.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'telemetry') {
+              const t = msg.data;
+              telemetry._handleTelem({
+                cpu0: t.cpu0_percent !== undefined ? t.cpu0_percent : t.cpu_percent,
+                cpu1: t.cpu1_percent !== undefined ? t.cpu1_percent : t.cpu_percent,
+                heapFree: t.free_heap,
+                heapTotal: 262144,
+                heapMinFree: t.min_free_heap,
+                uptimeMs: t.uptime_ms,
+                latency: t.mic_peak,
+              });
+            } else if (msg.type === 'state') {
+              if (msg.state === 'STREAMING') {
+                telemetry._setTranscriptStatus('wake', '🎙️ STREAMING AUDIO / LISTENING');
+                telemetry._setTranscriptText('Wake word / Trigger active. Listening for command...', false);
+              } else if (msg.state === 'TRANSCRIBING') {
+                telemetry._setTranscriptStatus('listening', '⚡ RUNNING WHISPER ASR');
+              } else if (msg.state === 'IDLE') {
+                if (!telemetry.lastTranscript) {
+                  telemetry._setTranscriptStatus('waiting', 'IDLE (READY FOR SPEECH)');
+                }
+              }
+            } else if (msg.type === 'result') {
+              const res = msg.data;
+              if (res.transcript) {
+                telemetry._setTranscriptText(res.transcript, true);
+              }
+            } else if (msg.type === 'audio_chunk' && msg.pcm16_b64) {
+              const pcm = telemetry._base64ToInt16(msg.pcm16_b64);
+              if (pcm) audioProc.processPcmChunk(pcm);
+            }
+          } catch (err) {
+            console.error('SSE Error:', err);
+          }
+        };
+
+        evtSource.onerror = () => {
+          telemetry._updateStatus('connecting', 'Connecting to Server...');
+        };
+      }
+
+      initBackendStream();
+    });
+
+  </script>
+</body>
+</html>

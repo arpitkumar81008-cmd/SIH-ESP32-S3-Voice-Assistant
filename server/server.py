@@ -6,6 +6,7 @@ Supports both:
 """
 
 import asyncio
+import base64
 import json
 import os
 import struct
@@ -15,7 +16,7 @@ from typing import List, Dict, Any, Optional
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -149,6 +150,14 @@ def pcm_bytes_to_float32(chunk_bytes: bytes) -> np.ndarray:
     return np.array(samples, dtype=np.float32) / 32768.0
 
 
+HALLUCINATIONS = {
+    "you", "you.", "you!", "you you", "you, you", "you you you",
+    "thank you.", "thank you", "thank you!", "thank you for watching.",
+    "thank you for watching", "subtitles by", "subtitles",
+    "subtitles by the amara.org community", "bye", "bye.", "bye!"
+}
+
+
 def transcribe_sync(audio_bytes: bytes) -> str:
     audio_np = pcm_bytes_to_float32(audio_bytes)
     if len(audio_np) == 0:
@@ -157,41 +166,42 @@ def transcribe_sync(audio_bytes: bytes) -> str:
     rms = float(np.sqrt(np.mean(audio_np ** 2)))
     max_amp = float(np.max(np.abs(audio_np)))
 
-    # Only reject if audio is virtually pure zeros / dead mic (< 45 LSBs out of 32768)
-    if max_amp < 0.0015 and rms < 0.0003:
-        return "(Silence - No audible speech / check mic connection)"
+    # Reject if audio is ambient noise or low-amplitude room hiss (< 0.035 peak or < 0.005 RMS)
+    if max_amp < 0.035 and rms < 0.005:
+        print(f"[whisper] Rejecting ambient noise (max_amp={max_amp:.4f}, rms={rms:.4f})")
+        return ""
 
-    # Safe Peak Normalization: scale up quiet audio up to 0.85 peak without ANY clipping distortion
-    if 0.005 < max_amp < 0.85:
-        gain = min(3.0, 0.85 / max_amp)
+    # Peak Normalization: only for real speech signals (max_amp >= 0.04)
+    if 0.04 <= max_amp < 0.70:
+        gain = min(2.5, 0.70 / max_amp)
         audio_np = audio_np * gain
 
-    # Whisper transcription with repetition penalty and compression filter to eliminate repetition loops
+    # Whisper transcription with strict anti-hallucination settings
     segments, _ = whisper_model.transcribe(
         audio_np,
         language="en",
         beam_size=5,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
+        vad_parameters=dict(min_silence_duration_ms=400, threshold=0.5, speech_pad_ms=80),
         condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.2,
-        repetition_penalty=1.15,
+        no_speech_threshold=0.55,
+        compression_ratio_threshold=2.0,
+        repetition_penalty=1.25,
+        hallucination_silence_threshold=0.5,
     )
     res = " ".join(seg.text.strip() for seg in segments).strip()
 
-    # Fallback without vad_filter if internal VAD was overly aggressive on soft voices
-    if not res:
-        segments, _ = whisper_model.transcribe(
-            audio_np,
-            language="en",
-            beam_size=3,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.2,
-        )
-        res = " ".join(seg.text.strip() for seg in segments).strip()
+    # Suppress common Whisper hallucination loops on ambient noise
+    cleaned_lower = res.lower().strip().rstrip(".!?,")
+    if cleaned_lower in HALLUCINATIONS or len(cleaned_lower) <= 1:
+        print(f"[whisper] Suppressed hallucination: {res!r}")
+        return ""
+
+    # Check for repetitive loops like "you, you, you"
+    words = cleaned_lower.split()
+    if len(words) >= 3 and len(set(words)) == 1:
+        print(f"[whisper] Suppressed repetitive loop: {res!r}")
+        return ""
 
     return res
 
@@ -248,8 +258,8 @@ async def finalize_session(session: Session, stop_callback, loop, reason="silenc
     except Exception as ex:
         print(f"[warn] Could not save WAV file: {ex}")
 
-    if duration_sec < 0.4:
-        print("[transcript] (Audio too brief, skipping Whisper)")
+    if duration_sec < 0.4 or (not session.speech_started and session.max_peak < 0.04):
+        print(f"[transcript] (Ambient noise / no speech detected, skipping Whisper: peak={session.max_peak:.3f})")
         session.reset()
         latest_metrics["state"] = "IDLE"
         await broadcast_event({"type": "state", "state": "IDLE"})
@@ -599,238 +609,15 @@ async def get_status():
     }
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-@app.get("/", response_class=HTMLResponse)
+DASHBOARD_FILE = os.path.join(os.path.dirname(__file__), "dashboard.html")
+
+
+@app.get("/dashboard")
+@app.get("/")
 async def dashboard():
-    return """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>SIH Edge AI - ESP32-S3 Voice Assistant Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    @keyframes pulse-slow { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-    .pulse-dot { animation: pulse-slow 1.5s infinite ease-in-out; }
-  </style>
-</head>
-<body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
-  <div class="max-w-6xl mx-auto space-y-6">
-    <header class="flex flex-col md:flex-row items-start md:items-center justify-between border-b border-slate-800 pb-4">
-      <div>
-        <h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-3">
-          <span class="text-cyan-400">🎙️ Smart India Hackathon</span>
-          <span class="text-sm bg-cyan-950/80 border border-cyan-700/50 text-cyan-300 px-2.5 py-0.5 rounded-full">Edge AI Pipeline</span>
-        </h1>
-        <p class="text-xs text-slate-400 mt-1">ESP32-S3 (On-device KWS) ──> USB Serial (921600) ──> Faster-Whisper + Silero VAD</p>
-      </div>
-      <div class="flex flex-wrap items-center gap-3">
-        <!-- Live Diagnostic Mic Status LED -->
-        <div id="micLedBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold bg-red-950/80 border border-red-600 text-red-300 transition-all">
-          <span id="micLedDot" class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]"></span>
-          <span id="micLedText">🔴 MIC: WAITING FOR SIGNAL</span>
-        </div>
-
-        <!-- Pipeline Status Badge -->
-        <div id="statusBadge" class="flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold bg-emerald-950/80 border border-emerald-600 text-emerald-300">
-          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 pulse-dot"></span>
-          <span id="statusText">IDLE (WAITING FOR WAKE WORD)</span>
-        </div>
-
-        <!-- Manual Trigger Button -->
-        <button onclick="triggerESP()" class="px-3.5 py-1.5 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg text-xs font-bold transition flex items-center gap-1.5 shadow-md active:scale-95">
-          <span>🎙️ Test Trigger (BOOT)</span>
-        </button>
-      </div>
-    </header>
-
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
-        <div class="flex items-center justify-between text-xs text-slate-400">
-          <span>ESP32-S3 CPU Load</span>
-          <span class="px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800 text-[10px] font-mono">&lt;10% Target</span>
-        </div>
-        <div class="mt-2 flex items-baseline gap-2">
-          <span id="cpuVal" class="text-3xl font-extrabold text-cyan-400">0</span>
-          <span class="text-sm text-slate-400">%</span>
-        </div>
-        <div class="w-full bg-slate-800 rounded-full h-2 mt-3 overflow-hidden">
-          <div id="cpuBar" class="bg-cyan-400 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
-        </div>
-      </div>
-
-      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
-        <div class="flex items-center justify-between text-xs text-slate-400">
-          <span>RAM Budget (256 KB)</span>
-          <span id="ramFree" class="text-[10px] font-mono text-emerald-400">256 KB Free</span>
-        </div>
-        <div class="mt-2 flex items-baseline gap-2">
-          <span id="ramUsed" class="text-3xl font-extrabold text-purple-400">0</span>
-          <span class="text-sm text-slate-400">KB Used</span>
-        </div>
-        <div class="w-full bg-slate-800 rounded-full h-2 mt-3 overflow-hidden">
-          <div id="ramBar" class="bg-purple-500 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
-        </div>
-      </div>
-
-      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
-        <div class="text-xs text-slate-400">Whisper ASR Latency</div>
-        <div class="mt-2 flex items-baseline gap-2">
-          <span id="whisperLat" class="text-3xl font-extrabold text-amber-400">0</span>
-          <span class="text-sm text-slate-400">ms</span>
-        </div>
-        <p class="text-[11px] text-slate-400 mt-3">Faster-Whisper (int8 CPU)</p>
-      </div>
-
-      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col justify-between">
-        <div class="text-xs text-slate-400">Total Pipeline Latency</div>
-        <div class="mt-2 flex items-baseline gap-2">
-          <span id="totalLat" class="text-3xl font-extrabold text-emerald-400">0</span>
-          <span class="text-sm text-slate-400">ms</span>
-        </div>
-        <p id="audioLen" class="text-[11px] text-slate-400 mt-3">Wake ➔ Speech ➔ Final Text</p>
-      </div>
-    </div>
-
-    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
-      <div class="flex items-center justify-between">
-        <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-          <span>⚡ Live Transcription Result</span>
-        </h2>
-        <span id="lastTime" class="text-xs text-slate-400">Waiting for utterance...</span>
-      </div>
-      <div id="latestTranscriptBox" class="bg-slate-950 border border-slate-800 rounded-lg p-4 min-h-[90px] flex items-center">
-        <p id="latestTranscript" class="text-xl font-medium text-slate-100 italic">Say the wake word and speak your command...</p>
-      </div>
-    </div>
-
-    <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-      <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider">Session History Log</h2>
-      <div class="overflow-x-auto">
-        <table class="w-full text-left text-xs text-slate-300">
-          <thead class="text-[11px] uppercase bg-slate-800/60 text-slate-400">
-            <tr>
-              <th class="p-3">Time</th>
-              <th class="p-3">Transcription</th>
-              <th class="p-3">Audio Duration</th>
-              <th class="p-3">Whisper Latency</th>
-              <th class="p-3">Total E2E</th>
-            </tr>
-          </thead>
-          <tbody id="historyBody" class="divide-y divide-slate-800">
-            <tr><td colspan="5" class="p-4 text-center text-slate-400">No utterances recorded yet.</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const evtSource = new EventSource('/events');
-
-    evtSource.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'telemetry') {
-        updateTelemetry(msg.data);
-      } else if (msg.type === 'state') {
-        updateState(msg.state);
-      } else if (msg.type === 'result') {
-        addResult(msg.data);
-      }
-    };
-
-    let latestPipelineStatus = 'IDLE';
-
-    function updateState(state) {
-      latestPipelineStatus = state;
-      const badge = document.getElementById('statusBadge');
-      const text = document.getElementById('statusText');
-      const ledBadge = document.getElementById('micLedBadge');
-      const ledDot = document.getElementById('micLedDot');
-      const ledText = document.getElementById('micLedText');
-
-      if (state === 'STREAMING') {
-        badge.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold bg-cyan-950/80 border border-cyan-500 text-cyan-300';
-        text.innerText = '🎙️ LISTENING / STREAMING AUDIO';
-        // Flash Red on trigger / streaming
-        ledBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold bg-red-950/90 border border-red-500 text-red-200 animate-pulse';
-        ledDot.className = 'w-3 h-3 rounded-full bg-red-500 shadow-[0_0_12px_rgba(239,68,68,1)]';
-        ledText.innerText = '🚨 WAKE WORD TRIGGERED / STREAMING';
-      } else if (state === 'TRANSCRIBING') {
-        badge.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold bg-amber-950/80 border border-amber-500 text-amber-300';
-        text.innerText = '⚡ RUNNING WHISPER ASR';
-      } else {
-        badge.className = 'flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-semibold bg-emerald-950/80 border border-emerald-600 text-emerald-300';
-        text.innerText = 'IDLE (WAITING FOR WAKE WORD)';
-      }
-    }
-
-    function updateTelemetry(t) {
-      document.getElementById('cpuVal').innerText = t.cpu_percent || 0;
-      document.getElementById('cpuBar').style.width = Math.min(t.cpu_percent || 0, 100) + '%';
-
-      const usedKb = Math.round((t.used_heap || 0) / 1024);
-      const freeKb = Math.round((t.free_heap || 0) / 1024);
-      document.getElementById('ramUsed').innerText = usedKb;
-      document.getElementById('ramFree').innerText = freeKb + ' KB Free';
-      document.getElementById('ramBar').style.width = Math.min((usedKb / 256) * 100, 100) + '%';
-
-      const peak = t.mic_peak || 0;
-      const rawHex = t.raw_hex || "0x00000000";
-      const ledBadge = document.getElementById('micLedBadge');
-      const ledDot = document.getElementById('micLedDot');
-      const ledText = document.getElementById('micLedText');
-
-      if (latestPipelineStatus !== 'STREAMING') {
-        if (peak >= 500) {
-          ledBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold bg-emerald-950/80 border border-emerald-500 text-emerald-300';
-          ledDot.className = 'w-3 h-3 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]';
-          ledText.innerText = '🟢 MIC DETECTING AUDIO (Peak: ' + peak + ')';
-        } else {
-          ledBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold bg-red-950/80 border border-red-600 text-red-300';
-          ledDot.className = 'w-3 h-3 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]';
-          ledText.innerText = '🔴 CONSTANT RED: SILENT / WAITING (Peak: ' + peak + ')';
-        }
-      }
-    }
-
-    async function triggerESP() {
-      try {
-        const res = await fetch('/api/trigger', { method: 'POST' });
-        const data = await res.json();
-        console.log('Trigger result:', data);
-      } catch (err) {
-        console.error('Trigger error:', err);
-      }
-    }
-
-    function addResult(r) {
-      document.getElementById('whisperLat').innerText = r.whisper_latency_ms;
-      document.getElementById('totalLat').innerText = r.total_e2e_latency_ms;
-      document.getElementById('audioLen').innerText = 'Audio length: ' + r.audio_duration_sec + 's';
-      document.getElementById('latestTranscript').innerText = '\"' + r.transcript + '\"';
-      document.getElementById('latestTranscript').className = 'text-xl font-medium text-emerald-300';
-      document.getElementById('lastTime').innerText = new Date(r.timestamp * 1000).toLocaleTimeString();
-
-      const tbody = document.getElementById('historyBody');
-      const emptyRow = tbody.querySelector('tr td[colspan]');
-      if (emptyRow) tbody.innerHTML = '';
-
-      const row = `
-        <tr class="hover:bg-slate-800/40 transition">
-          <td class="p-3 text-slate-400">${new Date(r.timestamp * 1000).toLocaleTimeString()}</td>
-          <td class="p-3 font-medium text-white">${r.transcript}</td>
-          <td class="p-3 text-slate-400">${r.audio_duration_sec}s</td>
-          <td class="p-3 text-amber-400 font-mono">${r.whisper_latency_ms} ms</td>
-          <td class="p-3 text-emerald-400 font-mono font-semibold">${r.total_e2e_latency_ms} ms</td>
-        </tr>
-      `;
-      tbody.innerHTML = row + tbody.innerHTML;
-    }
-  </script>
-</body>
-</html>
-"""
+    if os.path.exists(DASHBOARD_FILE):
+        return FileResponse(DASHBOARD_FILE)
+    return HTMLResponse("<h1>Audi's Dashboard file not found at " + DASHBOARD_FILE + "</h1>")
 
 
 if __name__ == "__main__":
