@@ -127,16 +127,17 @@ namespace {
   TfLiteTensor* model_input = nullptr;
   TfLiteTensor* model_output = nullptr;
 
-  constexpr int kTensorArenaSize = 36 * 1024;
+  constexpr int kTensorArenaSize = 48 * 1024; // 48 KB internal arena for safety
   alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 }
 
 // ---------------- STATE MACHINE ----------------
 enum DeviceState { STATE_IDLE, STATE_STREAMING };
 volatile DeviceState deviceState = STATE_IDLE;
-QueueHandle_t triggerQueue;
+QueueHandle_t triggerQueue = nullptr;
 volatile uint32_t lastStreamEndTime = 0;
 volatile int16_t lastMicPeak = 0;
+volatile uint32_t lastRawSample = 0;
 
 // ---------------- CPU TELEMETRY ----------------
 volatile uint32_t idleCount0 = 0;
@@ -327,6 +328,7 @@ AcousticState evaluateAcousticGatekeeper(const int16_t *samples, size_t count, i
 bool extract_mfcc_features(const int16_t* audio_data, int8_t* feature_output) {
   const uint16_t n_fft = 512; 
   const int hop = 320;        
+  const int half_win = 200; // 25ms center offset
   
   static float vReal[n_fft];
   static float vImag[n_fft];
@@ -334,11 +336,13 @@ bool extract_mfcc_features(const int16_t* audio_data, int8_t* feature_output) {
   ArduinoFFT<float> FFT(vReal, vImag, n_fft, (float)SAMPLE_RATE);
 
   for (int frame = 0; frame < 51; frame++) {
-    int start_idx = frame * hop;
+    int center_sample = frame * hop;
+    int start_idx = center_sample - half_win;
     
     for (int i = 0; i < n_fft; i++) {
-      if (start_idx + i < KWS_WINDOW_SAMPLES) {
-        vReal[i] = (float)audio_data[start_idx + i];
+      int s_idx = start_idx + i;
+      if (s_idx >= 0 && s_idx < KWS_WINDOW_SAMPLES) {
+        vReal[i] = (float)audio_data[s_idx];
       } else {
         vReal[i] = 0.0f;
       }
@@ -375,8 +379,10 @@ void fireWakeWordTrigger() {
   if (now - lastStreamEndTime < TRIGGER_COOLDOWN_MS) return;
   if (deviceState != STATE_IDLE) return;
 
-  bool val = true;
-  xQueueSend(triggerQueue, &val, 0);
+  if (triggerQueue) {
+    bool val = true;
+    xQueueSend(triggerQueue, &val, 0);
+  }
 }
 
 #if USE_PHYSICAL_BUTTON
@@ -385,10 +391,12 @@ void IRAM_ATTR onButtonPress() {
   if (now - lastStreamEndTime < 500) return;
   if (deviceState != STATE_IDLE) return;
 
-  bool val = true;
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  xQueueSendFromISR(triggerQueue, &val, &xHigherPriorityTaskWoken);
-  if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+  if (triggerQueue) {
+    bool val = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(triggerQueue, &val, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+  }
 }
 #endif
 
@@ -418,7 +426,7 @@ void sendTelemetry() {
 
 #if ENABLE_NETWORK_STREAM
   if (wsConnected) {
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<300> doc;
     doc["event"] = "telemetry";
     doc["free_heap"] = freeHeap;
     doc["min_free_heap"] = minFreeHeap;
@@ -427,6 +435,9 @@ void sendTelemetry() {
     doc["cpu_percent"] = cpuAvgPercent;
     doc["uptime_ms"] = uptime;
     doc["mic_peak"] = lastMicPeak;
+    doc["raw_hex"] = String("0x") + String(lastRawSample, HEX);
+    doc["acoustic_state"] = (acousticGateState == ACOUSTIC_VOICE) ? "VOICE" : 
+                            ((acousticGateState == ACOUSTIC_ROOM_AUDIO) ? "ROOM_AUDIO" : "SILENCE");
     String out;
     serializeJson(doc, out);
     webSocket.sendTXT(out);
@@ -435,9 +446,12 @@ void sendTelemetry() {
 
   Serial.printf("{\"event\":\"telemetry\",\"free_heap\":%u,\"min_free_heap\":%u,"
                 "\"cpu0_percent\":%d,\"cpu1_percent\":%d,\"cpu_percent\":%d,\"uptime_ms\":%u,"
-                "\"mic_peak\":%d}\n",
+                "\"mic_peak\":%d,\"raw_hex\":\"0x%08X\","
+                "\"gatekeeper\":\"%s\"}\n",
                 freeHeap, minFreeHeap, cpu0Percent, cpu1Percent, cpuAvgPercent, uptime,
-                lastMicPeak);
+                lastMicPeak, lastRawSample,
+                (acousticGateState == ACOUSTIC_VOICE) ? "VOICE" : 
+                ((acousticGateState == ACOUSTIC_ROOM_AUDIO) ? "ROOM_AUDIO" : "SILENCE"));
 }
 
 // ---------------- CORE 0 TASK: Audio Capture, Acoustic Gatekeeper & KWS ----------------
@@ -470,15 +484,21 @@ void audioCaptureTask(void *param) {
       else if (sumChan1 > sumChan0 * 2) activeChannel = 1;
 
       int16_t peak = 0;
+      int32_t maxRaw = 0;
+
       for (size_t i = 0; i < stereoPairs; i++) {
         int32_t rawSample = rawStereo[2 * i + activeChannel];
+
+        if (abs(rawSample) > abs(maxRaw)) {
+          maxRaw = rawSample;
+        }
 
         // Step 1: Smooth 40Hz Pre-Scale DC High-Pass Filter (removes INMP441 DC offset)
         dcTracker += (rawSample - dcTracker) >> 6;
         int32_t acSample = rawSample - dcTracker;
 
-        // Step 2: Calibrated 16-bit scaling
-        int32_t scaled = acSample >> 8;
+        // Step 2: Calibrated 16-bit scaling (>> 11 provides 32x digital gain for INMP441 -26 dBFS)
+        int32_t scaled = acSample >> 11;
         if (scaled > 32767) scaled = 32767;
         if (scaled < -32768) scaled = -32768;
 
@@ -496,6 +516,7 @@ void audioCaptureTask(void *param) {
       }
 
       lastMicPeak = peak;
+      lastRawSample = (uint32_t)maxRaw;
 
       // Always write to streaming ring buffer so look-back window remains full!
       ringBufferWrite(chunk, stereoPairs);
@@ -525,7 +546,7 @@ void audioCaptureTask(void *param) {
 
           // GATEKEEPER ENFORCEMENT:
           // ONLY invoke TFLM if human voice is actively detected above frequency threshold!
-          if (acousticGateState == ACOUSTIC_VOICE && interpreter != nullptr) {
+          if (acousticGateState == ACOUSTIC_VOICE && interpreter != nullptr && model_input != nullptr && model_output != nullptr) {
             if (millis() - lastStreamEndTime >= TRIGGER_COOLDOWN_MS) {
               
               // Unroll 1.0s circular buffer into linear memory
@@ -619,7 +640,7 @@ void streamManagerTask(void *param) {
       sendTelemetry();
     }
 
-    if (xQueueReceive(triggerQueue, &triggered, 0) == pdTRUE) {
+    if (triggerQueue && xQueueReceive(triggerQueue, &triggered, 0) == pdTRUE) {
       deviceState = STATE_STREAMING;
       serverStopSignal = false;
       rxCmdIdx = 0;
@@ -636,7 +657,7 @@ void streamManagerTask(void *param) {
 #endif
 
       // Initialize true FIFO read pointer to LOOKBACK_SAMPLES behind write pointer
-      if (xSemaphoreTake(ringMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (ringBuffer && ringMutex && xSemaphoreTake(ringMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         size_t lookback = min((size_t)totalSamplesWritten, LOOKBACK_SAMPLES);
         ringReadIdx = (ringWriteIdx + RING_BUFFER_SAMPLES - lookback) % RING_BUFFER_SAMPLES;
         xSemaphoreGive(ringMutex);
@@ -668,7 +689,7 @@ void streamManagerTask(void *param) {
         }
 
         size_t avail = 0;
-        if (xSemaphoreTake(ringMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (ringBuffer && ringMutex && xSemaphoreTake(ringMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
           avail = (ringWriteIdx + RING_BUFFER_SAMPLES - ringReadIdx) % RING_BUFFER_SAMPLES;
           if (avail >= I2S_READ_CHUNK) {
             for (size_t i = 0; i < I2S_READ_CHUNK; i++) {
