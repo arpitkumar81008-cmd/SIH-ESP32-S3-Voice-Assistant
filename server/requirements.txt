@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pyserial
+faster-whisper
+silero-vad
+numpy
