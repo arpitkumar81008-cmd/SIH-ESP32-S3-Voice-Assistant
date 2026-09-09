@@ -166,14 +166,9 @@ def transcribe_sync(audio_bytes: bytes) -> str:
     rms = float(np.sqrt(np.mean(audio_np ** 2)))
     max_amp = float(np.max(np.abs(audio_np)))
 
-    # Reject if audio is ambient noise or low-amplitude room hiss (< 0.035 peak or < 0.005 RMS)
-    if max_amp < 0.035 and rms < 0.005:
-        print(f"[whisper] Rejecting ambient noise (max_amp={max_amp:.4f}, rms={rms:.4f})")
-        return ""
-
-    # Peak Normalization: only for real speech signals (max_amp >= 0.04)
-    if 0.04 <= max_amp < 0.70:
-        gain = min(2.5, 0.70 / max_amp)
+    # Noise rejection bypassed for debugging
+    if 0.01 <= max_amp < 0.70:
+        gain = min(10.0, 0.70 / max_amp) # BOOST the volume heavily so Whisper can hear it
         audio_np = audio_np * gain
 
     # Whisper transcription with strict anti-hallucination settings
@@ -269,7 +264,11 @@ async def finalize_session(session: Session, stop_callback, loop, reason="silenc
         print(f"[transcript] (Warning: VAD did not detect speech, but running Whisper anyway. peak={session.max_peak:.3f})")
 
     t_whisper_start = time.perf_counter()
-    transcript = await loop.run_in_executor(EXECUTOR, transcribe_sync, audio_bytes)
+    try:
+        transcript = await loop.run_in_executor(EXECUTOR, transcribe_sync, audio_bytes)
+    except Exception as e:
+        print(f"[ERROR] Whisper transcription failed: {e}")
+        transcript = f"(Error transcribing: {e})"
     t_whisper_end = time.perf_counter()
 
     whisper_ms = (t_whisper_end - t_whisper_start) * 1000.0

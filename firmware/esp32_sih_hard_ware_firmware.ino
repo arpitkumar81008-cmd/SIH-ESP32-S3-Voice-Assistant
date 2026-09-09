@@ -499,8 +499,8 @@ void audioCaptureTask(void *param) {
         dcTracker += (rawSample - dcTracker) >> 6;
         int32_t acSample = rawSample - dcTracker;
 
-        // Step 2: Calibrated 16-bit scaling (>> 11 provides 32x digital gain for INMP441 -26 dBFS)
-        int32_t scaled = acSample >> 11;
+        // Step 2: High Digital Gain (>> 7 provides 512x digital gain since the mic is extremely quiet)
+        int32_t scaled = acSample >> 7;
         if (scaled > 32767) scaled = 32767;
         if (scaled < -32768) scaled = -32768;
 
