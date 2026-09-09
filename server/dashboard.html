@@ -1141,6 +1141,23 @@
         while (this.serialBuffer.length) {
           const b = this.serialBuffer;
 
+          // Firmware 0xAA 0x55 binary audio frame
+          if (b.length >= 2 && b[0] === 0xAA && b[1] === 0x55) {
+            if (b.length < 4) return;
+            const len = ((b[2] << 8) | b[3]) >>> 0;
+            if (len < 2 || len > 4096) {
+              this.serialBuffer = b.slice(2);
+              continue;
+            }
+            if (b.length < 4 + len) return;
+            const payload = b.slice(4, 4 + len);
+            this.serialBuffer = b.slice(4 + len);
+            this.packetsReceived++;
+            this._setTxt('val-packets', String(this.packetsReceived));
+            this.audioProc.processPcmChunk(payload.buffer);
+            continue;
+          }
+
           if (b.length >= 2 && b[0] === MAGIC0 && b[1] === MAGIC1) {
             if (b.length < HEADER) return;
             const len = (b[3] | (b[4] << 8) | (b[5] << 16) | (b[6] << 24)) >>> 0;
@@ -1164,7 +1181,7 @@
             if (b[i] === 0x0A) { newline = i; break; }
           }
           for (let i = 1; i + 1 < b.length; i++) {
-            if (b[i] === MAGIC0 && b[i + 1] === MAGIC1) { magic = i; break; }
+            if ((b[i] === 0xAA && b[i + 1] === 0x55) || (b[i] === MAGIC0 && b[i + 1] === MAGIC1)) { magic = i; break; }
           }
 
           if (magic > 0 && (newline < 0 || magic < newline)) {
@@ -1501,11 +1518,11 @@
       _handleTelem(d) {
         const src = (d.telemetry && typeof d.telemetry === 'object') ? d.telemetry : d;
 
-        this._assignNumber('cpu0', src.cpu0);
-        this._assignNumber('cpu1', src.cpu1);
-        this._assignNumber('heapFree', src.heap_free ?? src.heapFree);
-        this._assignNumber('heapTotal', src.heap_total ?? src.heapTotal);
-        this._assignNumber('heapMinFree', src.heap_min ?? src.heapMinFree);
+        this._assignNumber('cpu0', src.cpu0 ?? src.cpu0_percent ?? src.cpu_percent);
+        this._assignNumber('cpu1', src.cpu1 ?? src.cpu1_percent ?? src.cpu_percent);
+        this._assignNumber('heapFree', src.free_heap ?? src.heap_free ?? src.heapFree);
+        this._assignNumber('heapTotal', src.total_heap ?? src.heap_total ?? src.heapTotal ?? 327680);
+        this._assignNumber('heapMinFree', src.min_free_heap ?? src.heap_min ?? src.heapMinFree);
         this._assignNumber('psramFree', src.psram_free ?? src.psramFree);
         this._assignNumber('psramTotal', src.psram_total ?? src.psramTotal);
         this._assignNumber('temp', src.temp ?? src.temperature);
@@ -1518,6 +1535,63 @@
 
         const directLatency = Number(src.latency_ms ?? src.latency);
         if (Number.isFinite(directLatency)) this._recordLatency(directLatency);
+
+        // Ambient mic peak
+        const peak = Number(src.mic_peak ?? src.peak);
+        if (Number.isFinite(peak) && peak > 0 && !this.audioProc.isVoiceActive) {
+          const db = 20 * Math.log10(Math.max(peak, 1) / 32768.0);
+          const dbEl = document.getElementById('val-dbfs');
+          if (dbEl) dbEl.textContent = `${db.toFixed(1)} dBFS`;
+          const dbBar = document.getElementById('db-meter-bar');
+          if (dbBar) {
+            const width = Math.max(0, Math.min(100, (db + 90) * (100 / 80)));
+            dbBar.style.width = `${width}%`;
+          }
+        }
+
+        // Gatekeeper shield update
+        const gk = String(src.gatekeeper ?? src.acoustic_state ?? '').toUpperCase();
+        if (gk) {
+          const gkBadge = document.getElementById('gatekeeper-badge');
+          const gkText = document.getElementById('gatekeeper-text');
+          const gkDot = document.getElementById('gatekeeper-dot');
+          if (gkBadge && gkText && gkDot) {
+            if (gk.includes('VOICE')) {
+              gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-emerald-950/80 text-emerald-300 border border-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.5)] animate-pulse';
+              gkDot.className = 'w-2 h-2 rounded-full bg-emerald-400';
+              gkText.textContent = 'ACTIVE VOICE (OPEN)';
+            } else if (gk.includes('ROOM') || gk.includes('AUDIO')) {
+              gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-blue-950/70 text-blue-300 border border-blue-500/50';
+              gkDot.className = 'w-2 h-2 rounded-full bg-blue-400';
+              gkText.textContent = 'ROOM NOISE (FILTERED)';
+            } else {
+              gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-rose-950/60 text-rose-300 border border-rose-500/40';
+              gkDot.className = 'w-2 h-2 rounded-full bg-rose-500';
+              gkText.textContent = 'SILENCE (CLOSED)';
+            }
+          }
+        }
+
+        // Transport text
+        if (src.transport) {
+          const trText = document.getElementById('transport-text');
+          if (trText) trText.textContent = src.transport;
+        }
+
+        // Resource health check
+        const resBadge = document.getElementById('resource-health-badge');
+        const resText = document.getElementById('resource-health-text');
+        const avgCpu = ((this.metrics.cpu0 || 0) + (this.metrics.cpu1 || 0)) / 2;
+        const freeKb = (this.metrics.heapFree || 0) / 1024;
+        if (resBadge && resText && this.metrics.heapFree != null) {
+          if (avgCpu > 75 || freeKb < 60) {
+            resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-amber-950/70 text-amber-300 border border-amber-500/50 flex items-center gap-1.5';
+            resText.textContent = `ALERT: CPU ${avgCpu.toFixed(0)}% | RAM ${freeKb.toFixed(0)}KB`;
+          } else {
+            resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 flex items-center gap-1.5';
+            resText.textContent = `CPU & RAM: OPTIMAL (${avgCpu.toFixed(0)}% / ${freeKb.toFixed(0)}KB)`;
+          }
+        }
 
         this._updateDom();
       }
@@ -1826,8 +1900,9 @@
 
       // Trigger button helper
       window.triggerESP = async function() {
+        const baseUrl = (window.location.protocol === 'http:' || window.location.protocol === 'https:') ? '' : 'http://localhost:8080';
         try {
-          await fetch('/api/trigger', { method: 'POST' });
+          await fetch(`${baseUrl}/api/trigger`, { method: 'POST' });
         } catch (e) {
           console.error('Trigger request error:', e);
         }
@@ -1839,7 +1914,8 @@
         if (backendEvtSource) {
           try { backendEvtSource.close(); } catch (_) {}
         }
-        const evtSource = new EventSource('/events');
+        const baseUrl = (window.location.protocol === 'http:' || window.location.protocol === 'https:') ? '' : 'http://localhost:8080';
+        const evtSource = new EventSource(`${baseUrl}/events`);
         backendEvtSource = evtSource;
 
         evtSource.onopen = () => {
@@ -1854,72 +1930,7 @@
             telemetry._setTxt('val-packets', String(telemetry.packetsReceived));
 
             if (msg.type === 'telemetry') {
-              const t = msg.data;
-              telemetry._handleTelem({
-                cpu0: t.cpu0_percent !== undefined ? t.cpu0_percent : t.cpu_percent,
-                cpu1: t.cpu1_percent !== undefined ? t.cpu1_percent : t.cpu_percent,
-                heapFree: t.free_heap,
-                heapTotal: 262144,
-                heapMinFree: t.min_free_heap,
-                uptimeMs: t.uptime_ms,
-                latency: t.latency_ms !== undefined ? t.latency_ms : (t.rtt_ms !== undefined ? t.rtt_ms : null),
-                temp: t.temp !== undefined ? t.temp : t.temperature,
-                rssi: t.rssi
-              });
-
-              // Ambient Mic Peak in Idle
-              if (!audioProc.isVoiceActive && t.mic_peak !== undefined && t.mic_peak > 0) {
-                const idleDb = 20 * Math.log10(Math.max(t.mic_peak, 1) / 32768.0);
-                const dbEl = document.getElementById('val-dbfs');
-                if (dbEl) dbEl.textContent = `${idleDb.toFixed(1)} dBFS`;
-                const dbBar = document.getElementById('db-meter-bar');
-                if (dbBar) {
-                  const width = Math.max(0, Math.min(100, (idleDb + 90) * (100 / 80)));
-                  dbBar.style.width = `${width}%`;
-                }
-              }
-
-              // Real-Time Acoustic Gatekeeper Shield Update
-              const gk = (t.gatekeeper || t.acoustic_state || 'SILENCE').toUpperCase();
-              const gkBadge = document.getElementById('gatekeeper-badge');
-              const gkText = document.getElementById('gatekeeper-text');
-              const gkDot = document.getElementById('gatekeeper-dot');
-              if (gkBadge && gkText && gkDot) {
-                if (gk.includes('VOICE')) {
-                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-emerald-950/80 text-emerald-300 border border-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.5)] animate-pulse';
-                  gkDot.className = 'w-2 h-2 rounded-full bg-emerald-400';
-                  gkText.textContent = 'ACTIVE VOICE (OPEN)';
-                } else if (gk.includes('ROOM') || gk.includes('AUDIO')) {
-                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-blue-950/70 text-blue-300 border border-blue-500/50';
-                  gkDot.className = 'w-2 h-2 rounded-full bg-blue-400';
-                  gkText.textContent = 'ROOM NOISE (FILTERED)';
-                } else {
-                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-rose-950/60 text-rose-300 border border-rose-500/40';
-                  gkDot.className = 'w-2 h-2 rounded-full bg-rose-500';
-                  gkText.textContent = 'SILENCE (CLOSED)';
-                }
-              }
-
-              // Real-Time Transport Mode Update
-              if (t.transport) {
-                const trText = document.getElementById('transport-text');
-                if (trText) trText.textContent = t.transport;
-              }
-
-              // Real-Time Hardware Resource Limits Health Check
-              const resBadge = document.getElementById('resource-health-badge');
-              const resText = document.getElementById('resource-health-text');
-              const avgCpu = ((t.cpu0_percent || 0) + (t.cpu1_percent || 0)) / 2;
-              const freeKb = (t.free_heap || 0) / 1024;
-              if (resBadge && resText) {
-                if (avgCpu > 75 || freeKb < 60) {
-                  resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-amber-950/70 text-amber-300 border border-amber-500/50 flex items-center gap-1.5';
-                  resText.textContent = `ALERT: CPU ${avgCpu.toFixed(0)}% | RAM ${freeKb.toFixed(0)}KB`;
-                } else {
-                  resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 flex items-center gap-1.5';
-                  resText.textContent = `CPU & RAM: OPTIMAL (${avgCpu.toFixed(0)}% / ${freeKb.toFixed(0)}KB)`;
-                }
-              }
+              telemetry._handleTelem(msg.data);
             } else if (msg.type === 'transport') {
               const trText = document.getElementById('transport-text');
               if (trText && msg.transport) trText.textContent = msg.transport;
@@ -1949,7 +1960,7 @@
         };
 
         evtSource.onerror = () => {
-          telemetry._updateStatus('connecting', 'Connecting to Server...');
+          telemetry._updateStatus('connecting', 'Waiting for Server (http://localhost:8080)...');
         };
       }
 
