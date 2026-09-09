@@ -493,21 +493,33 @@ async def serial_listener_task():
     while is_running:
         ser = None
         try:
-            target_port = SERIAL_PORT
+            target_port = os.environ.get("ESP32_SERIAL_PORT", SERIAL_PORT)
             try:
                 import serial.tools.list_ports
-                available_ports = [p.device for p in serial.tools.list_ports.comports()]
-                if target_port not in available_ports and len(available_ports) > 0:
-                    print(f"[Serial] {target_port} not found. Available COM ports on system: {available_ports}")
-                    # Pick the first available port
-                    target_port = available_ports[0]
-                    print(f"[Serial] Auto-selecting {target_port}...")
+                ports = list(serial.tools.list_ports.comports())
+                port_devices = [p.device for p in ports]
+                if target_port not in port_devices and len(ports) > 0:
+                    # Prefer known USB-to-UART bridge chips (CP210x, CH340, FTDI, Espressif)
+                    esp_ports = [
+                        p.device for p in ports 
+                        if any(k in (f"{p.description} {getattr(p, 'hwid', '')}").upper() 
+                               for k in ["CP210", "CH34", "CH91", "UART", "ESPRESSIF", "303A", "USB SERIAL"])
+                    ]
+                    if esp_ports:
+                        target_port = esp_ports[0]
+                    else:
+                        target_port = ports[-1].device
+                    print(f"[Serial] Auto-selected ESP32 port: {target_port} (Detected ports: {port_devices})")
             except Exception:
                 pass
 
             print(f"[Serial] Connecting to ESP32 on {target_port} @ {SERIAL_BAUD} baud...")
-            ser = serial.Serial(target_port, SERIAL_BAUD, timeout=0.05)
+            ser = serial.Serial(target_port, SERIAL_BAUD, timeout=0.01)
             active_serial_conn = ser
+            transport_label = f"USB Serial ({target_port})"
+            latest_telemetry["transport"] = transport_label
+            await broadcast_event({"type": "transport", "transport": transport_label})
+            await broadcast_event({"type": "telemetry", "data": latest_telemetry})
             print(f"[+] Connected to ESP32 on USB Serial ({target_port} @ {SERIAL_BAUD})!")
 
             session = Session()
@@ -523,7 +535,17 @@ async def serial_listener_task():
             buffer = bytearray()
 
             while ser.is_open and is_running:
-                raw = ser.read(2048)
+                raw = None
+                try:
+                    waiting = ser.in_waiting
+                    if waiting > 0:
+                        raw = ser.read(min(waiting, 4096))
+                    else:
+                        await asyncio.sleep(0.005)
+                except Exception as read_err:
+                    print(f"[Serial] Port read error: {read_err}")
+                    break
+
                 if raw:
                     buffer.extend(raw)
 
@@ -540,8 +562,9 @@ async def serial_listener_task():
                                         payload = json.loads(line_str)
                                         event = payload.get("event")
                                         if event == "start":
-                                            await process_start_event(session, source="USB Serial")
+                                            await process_start_event(session, source=transport_label)
                                         elif event in ("telemetry", "stats"):
+                                            payload["transport"] = transport_label
                                             update_telemetry(payload)
                                             await broadcast_event({"type": "telemetry", "data": latest_telemetry})
                                     except Exception:
@@ -561,8 +584,9 @@ async def serial_listener_task():
                                         payload = json.loads(line_str)
                                         event = payload.get("event")
                                         if event == "start":
-                                            await process_start_event(session, source="USB Serial")
+                                            await process_start_event(session, source=transport_label)
                                         elif event in ("telemetry", "stats"):
+                                            payload["transport"] = transport_label
                                             update_telemetry(payload)
                                             await broadcast_event({"type": "telemetry", "data": latest_telemetry})
                                     except Exception:
@@ -595,9 +619,10 @@ async def serial_listener_task():
                     elif (not session.speech_started and elapsed >= NO_SPEECH_TIMEOUT_SEC) or (elapsed >= MAX_UTTERANCE_SEC):
                         await finalize_session(session, send_serial_stop, loop, reason="timeout")
 
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.002)
 
         except Exception as ex:
+            active_serial_conn = None
             if ser and ser.is_open:
                 try: ser.close()
                 except Exception: pass
@@ -660,6 +685,30 @@ async def dashboard():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="ESP32-S3 Speech AI Server")
+    parser.add_argument("--port", type=str, default=SERIAL_PORT, help="ESP32 COM port (e.g. COM7 or /dev/ttyUSB0)")
+    parser.add_argument("--baud", type=int, default=SERIAL_BAUD, help="ESP32 Serial Baud Rate (default: 921600)")
+    parser.add_argument("--host", type=str, default=HOST, help="HTTP Server Host (default: 0.0.0.0)")
+    parser.add_argument("--http-port", type=int, default=PORT, help="HTTP Server Port (default: 8080)")
+    args, _ = parser.parse_known_args()
+
+    SERIAL_PORT = args.port
+    SERIAL_BAUD = args.baud
+    HOST = args.host
+    PORT = args.http_port
+
+    try:
+        import serial.tools.list_ports
+        available = [f"{p.device} ({p.description})" for p in serial.tools.list_ports.comports()]
+        print(f"[System] Available Serial Devices: {available if available else 'None found'}")
+    except Exception:
+        pass
+
+    print(f"[Server] Starting FastAPI Server on http://{HOST}:{PORT}")
+    print(f"[Server] Dashboard URL: http://localhost:{PORT}")
+    print(f"[Server] Configured Serial Target: {SERIAL_PORT} @ {SERIAL_BAUD} baud")
+
     try:
         uvicorn.run(app, host=HOST, port=PORT)
     except KeyboardInterrupt:
