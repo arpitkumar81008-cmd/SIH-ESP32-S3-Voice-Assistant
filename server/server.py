@@ -378,7 +378,7 @@ def update_telemetry(payload: dict):
     cpu1 = payload.get("cpu1_percent", cpu)
     free_heap = payload.get("free_heap", payload.get("ram", 0))
     min_free = payload.get("min_free_heap", free_heap)
-    used_heap = max(0, 262144 - free_heap)
+    used_heap = max(0, 327680 - free_heap)
     gatekeeper = payload.get("gatekeeper", payload.get("acoustic_state", latest_telemetry.get("gatekeeper", "SILENCE")))
     transport = payload.get("transport", latest_telemetry.get("transport", "Waiting..."))
 
