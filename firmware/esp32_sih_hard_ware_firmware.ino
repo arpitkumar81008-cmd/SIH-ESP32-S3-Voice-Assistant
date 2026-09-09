@@ -51,7 +51,7 @@
 // NOTE: ESP32-S3 Wi-Fi hardware supports 2.4 GHz ONLY (5 GHz Wi-Fi is not supported).
 #define WIFI_SSID   "ARPIT"               // 2.4 GHz Wi-Fi SSID
 #define WIFI_PASS   "123456789@"          // Wi-Fi Password
-#define WS_HOST     "192.168.1.100"       // Replace with PC IPv4 Address (find via ipconfig)
+#define WS_HOST     "10.86.102.251"       // Replace with PC IPv4 Address (find via ipconfig)
 #define WS_PORT     8080
 #define WS_PATH     "/stream"
 
