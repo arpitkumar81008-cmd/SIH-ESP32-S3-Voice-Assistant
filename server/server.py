@@ -367,36 +367,57 @@ async def process_audio_chunk(session: Session, chunk: bytes, stop_callback, loo
 def update_telemetry(payload: dict):
     global latest_telemetry
     cpu = payload.get("cpu_percent", payload.get("cpu", 0))
+    cpu0 = payload.get("cpu0_percent", cpu)
+    cpu1 = payload.get("cpu1_percent", cpu)
     free_heap = payload.get("free_heap", payload.get("ram", 0))
     min_free = payload.get("min_free_heap", free_heap)
     used_heap = max(0, 262144 - free_heap)
+    gatekeeper = payload.get("gatekeeper", payload.get("acoustic_state", latest_telemetry.get("gatekeeper", "SILENCE")))
+    transport = payload.get("transport", latest_telemetry.get("transport", "Waiting..."))
+
+    cpu_status = "OPTIMAL" if cpu < 75 else "HIGH LOAD"
+    ram_status = "OPTIMAL" if free_heap > 65536 else "LOW MEMORY"
 
     latest_telemetry.update({
         "cpu_percent": cpu,
-        "cpu0_percent": payload.get("cpu0_percent", cpu),
-        "cpu1_percent": payload.get("cpu1_percent", cpu),
+        "cpu0_percent": cpu0,
+        "cpu1_percent": cpu1,
         "free_heap": free_heap,
         "min_free_heap": min_free,
         "used_heap": used_heap,
         "uptime_ms": payload.get("uptime_ms", 0),
         "mic_peak": payload.get("mic_peak", 0),
         "raw_hex": payload.get("raw_hex", "0x00000000"),
+        "gatekeeper": gatekeeper,
+        "transport": transport,
+        "cpu_status": cpu_status,
+        "ram_status": ram_status,
         "last_updated": time.time(),
     })
 
+
+active_serial_conn = None
+active_ws_conn = None
 
 # --------------------------------------------------------------------------
 # WebSocket Transport (Wi-Fi Mode)
 # --------------------------------------------------------------------------
 @app.websocket("/stream")
 async def stream_endpoint(websocket: WebSocket):
+    global active_ws_conn
     await websocket.accept()
+    active_ws_conn = websocket
+    latest_telemetry["transport"] = "Wi-Fi WebSocket"
+    await broadcast_event({"type": "transport", "transport": "Wi-Fi WebSocket"})
     print("[+] ESP32 connected via WebSocket (Wi-Fi).")
     loop = asyncio.get_running_loop()
     session = Session()
 
     async def send_stop():
-        await websocket.send_text(json.dumps({"event": "stop"}))
+        try:
+            await websocket.send_text(json.dumps({"event": "stop"}))
+        except Exception:
+            pass
 
     try:
         while True:
@@ -414,30 +435,39 @@ async def stream_endpoint(websocket: WebSocket):
                     if event == "start":
                         await process_start_event(session, source="Wi-Fi WS")
                     elif event in ("telemetry", "stats"):
+                        payload["transport"] = "Wi-Fi WebSocket"
                         update_telemetry(payload)
                         await broadcast_event({"type": "telemetry", "data": latest_telemetry})
                 except Exception as e:
                     print(f"[warn] Error parsing WS message: {e}")
     except WebSocketDisconnect:
         pass
-    print("[-] ESP32 disconnected from WebSocket.")
-
-
-active_serial_conn = None
+    finally:
+        active_ws_conn = None
+        print("[-] ESP32 disconnected from WebSocket.")
 
 
 @app.post("/api/trigger")
 @app.get("/api/trigger")
 async def trigger_listening():
-    global active_serial_conn
+    global active_serial_conn, active_ws_conn
+    sent = False
+    if active_ws_conn:
+        try:
+            await active_ws_conn.send_text(json.dumps({"event": "trigger"}))
+            sent = True
+        except Exception as e:
+            print(f"[trigger] WS send error: {e}")
     if active_serial_conn and active_serial_conn.is_open:
         try:
             active_serial_conn.write(b"t\n")
             active_serial_conn.flush()
-            return {"status": "ok", "message": "Trigger sent to ESP32"}
+            sent = True
         except Exception as e:
-            return {"status": "error", "message": str(e)}
-    return {"status": "error", "message": "ESP32 serial connection not active"}
+            print(f"[trigger] Serial send error: {e}")
+    if sent:
+        return {"status": "ok", "message": "Trigger sent to ESP32 (Wi-Fi/Serial)"}
+    return {"status": "error", "message": "Neither Wi-Fi nor Serial ESP32 connection is active"}
 
 
 # --------------------------------------------------------------------------

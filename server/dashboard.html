@@ -243,6 +243,41 @@
       </div>
     </header>
 
+    <!-- Edge AI, Acoustic Gatekeeper & Resource Limits Banner -->
+    <div class="glass-panel p-3.5 flex flex-wrap items-center justify-between gap-3 border border-cyan-500/20 shadow-[0_4px_20px_rgba(0,0,0,0.4)]">
+      <div class="flex flex-wrap items-center gap-3">
+        <!-- Acoustic Gatekeeper Shield -->
+        <div class="flex items-center space-x-2 bg-slate-950/80 px-3 py-1.5 rounded-lg border border-white/10">
+          <span class="text-[11px] font-mono text-slate-400">ACOUSTIC GATEKEEPER:</span>
+          <span id="gatekeeper-badge" class="flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-rose-950/60 text-rose-300 border border-rose-500/40">
+            <span id="gatekeeper-dot" class="w-2 h-2 rounded-full bg-rose-500"></span>
+            <span id="gatekeeper-text">SILENCE (CLOSED)</span>
+          </span>
+        </div>
+
+        <!-- Transport Badge -->
+        <div class="flex items-center space-x-2 bg-slate-950/80 px-3 py-1.5 rounded-lg border border-white/10">
+          <span class="text-[11px] font-mono text-slate-400">TRANSPORT:</span>
+          <span id="transport-badge" class="text-xs font-mono font-bold px-2.5 py-0.5 rounded bg-cyan-950/60 text-cyan-300 border border-cyan-500/40 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+            <span id="transport-text">Wi-Fi WebSocket</span>
+          </span>
+        </div>
+      </div>
+
+      <!-- Resource Health & Limit Status -->
+      <div class="flex items-center space-x-3 text-xs font-mono">
+        <div class="hidden sm:flex items-center space-x-2 text-slate-400">
+          <span>LIMITS:</span>
+          <span class="text-slate-300">CPU &lt; 75% &bull; RAM &gt; 80KB</span>
+        </div>
+        <div id="resource-health-badge" class="px-2.5 py-1 rounded text-xs font-mono font-bold bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+          <span id="resource-health-text">CPU &amp; RAM: OPTIMAL</span>
+        </div>
+      </div>
+    </div>
+
     <!-- Telemetry Cards Grid -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
 
@@ -1775,6 +1810,51 @@
                 uptimeMs: t.uptime_ms,
                 latency: t.mic_peak,
               });
+
+              // Real-Time Acoustic Gatekeeper Shield Update
+              const gk = (t.gatekeeper || t.acoustic_state || 'SILENCE').toUpperCase();
+              const gkBadge = document.getElementById('gatekeeper-badge');
+              const gkText = document.getElementById('gatekeeper-text');
+              const gkDot = document.getElementById('gatekeeper-dot');
+              if (gkBadge && gkText && gkDot) {
+                if (gk.includes('VOICE')) {
+                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-emerald-950/80 text-emerald-300 border border-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.5)] animate-pulse';
+                  gkDot.className = 'w-2 h-2 rounded-full bg-emerald-400';
+                  gkText.textContent = 'ACTIVE VOICE (OPEN)';
+                } else if (gk.includes('ROOM') || gk.includes('AUDIO')) {
+                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-blue-950/70 text-blue-300 border border-blue-500/50';
+                  gkDot.className = 'w-2 h-2 rounded-full bg-blue-400';
+                  gkText.textContent = 'ROOM NOISE (FILTERED)';
+                } else {
+                  gkBadge.className = 'flex items-center space-x-1.5 px-2.5 py-0.5 rounded text-xs font-mono font-bold bg-rose-950/60 text-rose-300 border border-rose-500/40';
+                  gkDot.className = 'w-2 h-2 rounded-full bg-rose-500';
+                  gkText.textContent = 'SILENCE (CLOSED)';
+                }
+              }
+
+              // Real-Time Transport Mode Update
+              if (t.transport) {
+                const trText = document.getElementById('transport-text');
+                if (trText) trText.textContent = t.transport;
+              }
+
+              // Real-Time Hardware Resource Limits Health Check
+              const resBadge = document.getElementById('resource-health-badge');
+              const resText = document.getElementById('resource-health-text');
+              const avgCpu = ((t.cpu0_percent || 0) + (t.cpu1_percent || 0)) / 2;
+              const freeKb = (t.free_heap || 0) / 1024;
+              if (resBadge && resText) {
+                if (avgCpu > 75 || freeKb < 60) {
+                  resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-amber-950/70 text-amber-300 border border-amber-500/50 flex items-center gap-1.5';
+                  resText.textContent = `ALERT: CPU ${avgCpu.toFixed(0)}% | RAM ${freeKb.toFixed(0)}KB`;
+                } else {
+                  resBadge.className = 'px-2.5 py-1 rounded text-xs font-mono font-bold bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 flex items-center gap-1.5';
+                  resText.textContent = `CPU & RAM: OPTIMAL (${avgCpu.toFixed(0)}% / ${freeKb.toFixed(0)}KB)`;
+                }
+              }
+            } else if (msg.type === 'transport') {
+              const trText = document.getElementById('transport-text');
+              if (trText && msg.transport) trText.textContent = msg.transport;
             } else if (msg.type === 'state') {
               if (msg.state === 'STREAMING') {
                 telemetry._setTranscriptStatus('wake', '🎙️ STREAMING AUDIO / LISTENING');

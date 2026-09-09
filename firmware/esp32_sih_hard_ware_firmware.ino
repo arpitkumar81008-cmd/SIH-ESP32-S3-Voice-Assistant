@@ -36,7 +36,7 @@
 #endif
 
 // ---------------- BUILD FLAGS ----------------
-#define ENABLE_NETWORK_STREAM 0   // 0 = USB Serial (Prototype Demo), 1 = Wi-Fi WebSocket
+#define ENABLE_NETWORK_STREAM 1   // 0 = USB Serial (Demo), 1 = Wi-Fi WebSocket (Active)
 #define USE_FAKE_AUDIO        0   // 0 = Real INMP441 I2S microphone (GPIO 4, 5, 7)
 #define USE_PHYSICAL_BUTTON   1   // 1 = BOOT button (GPIO 0) backup trigger
 #define USE_STATUS_LED        1   // 1 = Status LED (GPIO 2)
@@ -186,6 +186,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_TEXT:
       if (payload && strstr((const char *)payload, "\"stop\"") != nullptr) {
         serverStopSignal = true;
+      } else if (payload && (strstr((const char *)payload, "trigger") != nullptr || strstr((const char *)payload, "\"start\"") != nullptr)) {
+        fireWakeWordTrigger();
       }
       break;
     default:
