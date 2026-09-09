@@ -203,20 +203,22 @@
 
       <!-- Controls & Mode Selector -->
       <div class="flex flex-wrap items-center gap-3">
-        <select id="mode-select" class="text-xs bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-3 py-2 font-mono">
-          <option value="serial" selected>USB-C WebSerial</option>
-          <option value="ws">Wi-Fi WebSocket (ws://)</option>
-          <option value="sim">Simulation / Demo Mode</option>
+        <select id="mode-select" class="text-xs bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-3 py-2 font-mono focus:border-cyan-500 outline-none">
+          <option value="hub" selected>🌐 Unified Server Hub (Auto Wi-Fi/Serial)</option>
+          <option value="serial">🔌 Direct USB-C WebSerial (Legacy)</option>
+          <option value="sim">🎮 Simulation / Demo Mode</option>
         </select>
 
-        <!-- WebSocket Input Container -->
-        <div id="ws-controls" class="hidden items-center space-x-2">
-          <input type="text" id="ws-url" value="ws://192.168.4.1:81/ws" placeholder="ws://esp32-ip:81/ws" class="text-xs bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 w-48 font-mono text-cyan-300 focus:border-cyan-500 outline-none">
-          <button id="btn-ws-connect" class="text-xs bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold px-4 py-2 rounded-lg transition shadow-[0_0_10px_rgba(0,240,255,0.3)]">Connect</button>
+        <!-- Hub Controls (Default) -->
+        <div id="hub-controls" class="flex items-center space-x-2">
+          <!-- Web Trigger Button -->
+          <button onclick="triggerESP()" class="text-xs bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold px-3.5 py-2 rounded-lg transition shadow-[0_0_12px_rgba(0,240,255,0.3)] active:scale-95 flex items-center gap-1.5 cursor-pointer">
+            <span>🎙️ Trigger (BOOT)</span>
+          </button>
         </div>
 
         <!-- Serial Input Container -->
-        <div id="serial-controls" class="flex items-center space-x-2">
+        <div id="serial-controls" class="hidden items-center space-x-2">
           <select id="serial-baud" class="text-xs bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-2 py-2 font-mono">
             <option value="921600">921600 Baud</option>
             <option value="115200">115200 Baud</option>
@@ -235,11 +237,6 @@
           <span id="status-led" class="w-2 h-2 rounded-full bg-rose-400"></span>
           <span id="status-text">Connecting to Server...</span>
         </div>
-
-        <!-- Web Trigger Button -->
-        <button onclick="triggerESP()" class="text-xs bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold px-3.5 py-1.5 rounded-lg transition shadow-[0_0_12px_rgba(0,240,255,0.3)] active:scale-95 flex items-center gap-1.5">
-          <span>🎙️ Trigger (BOOT)</span>
-        </button>
       </div>
     </header>
 
@@ -746,6 +743,19 @@
         this.isVoiceActive = false;
         this.syntheticMode = false;
         this.nextAudioTime = 0;
+        this.lastChunkTime = 0;
+
+        // Auto-initialize AudioContext
+        this.initAudioContext();
+        // Modern browsers require a user interaction to resume AudioContext
+        const resumeCtx = () => {
+          if (this.audioCtx && this.audioCtx.state === 'suspended') {
+            this.audioCtx.resume().catch(() => {});
+          }
+        };
+        ['click', 'touchstart', 'keydown'].forEach(ev => {
+          window.addEventListener(ev, resumeCtx, { passive: true });
+        });
       }
 
       async initAudioContext() {
@@ -767,7 +777,7 @@
           }
           return this.audioCtx.state === 'running';
         } catch (e) {
-          console.warn('AudioContext init failed:', e);
+          console.warn('AudioContext init error:', e);
           return false;
         }
       }
@@ -783,6 +793,7 @@
         this.currentDb = -100;
         this.isVoiceActive = false;
         this.nextAudioTime = 0;
+        this.lastChunkTime = 0;
       }
 
       setFftSize(sz) {
@@ -821,19 +832,31 @@
         }
 
         if (!int16.length) return;
+        this.lastChunkTime = performance.now();
 
+        // 1. Calculate RMS & peak directly from PCM
         let sum = 0;
+        let peak = 0;
         for (let i = 0; i < int16.length; i++) {
-          const n = int16[i] / 32768.0;
+          const s = int16[i];
+          const abs = Math.abs(s);
+          if (abs > peak) peak = abs;
+          const n = s / 32768.0;
           sum += n * n;
         }
         const rms = Math.sqrt(sum / int16.length);
         this.currentDb = rms > 1e-5 ? 20 * Math.log10(rms) : -100;
-        this.isVoiceActive = this.currentDb > -45;
+        this.isVoiceActive = this.currentDb > -45 || peak > 1500;
 
-        // Always feed real PCM into the analyser. The downstream gain node is
-        // set to 0 while "Listen to Audio" is disabled, so analysis still works
-        // without playing sound through the speakers.
+        // 2. Direct Oscilloscope waveform update from raw PCM (always works even if Web Audio suspended)
+        const step = Math.max(1, Math.floor(int16.length / this.timeData.length));
+        for (let i = 0; i < this.timeData.length; i++) {
+          const sampleIdx = Math.min(int16.length - 1, i * step);
+          const sample = int16[sampleIdx];
+          this.timeData[i] = Math.max(0, Math.min(255, Math.floor((sample / 32768.0 + 1.0) * 127.5)));
+        }
+
+        // 3. If Web Audio is active, route buffer to AnalyserNode
         if (this.audioCtx && this.audioCtx.state === 'running' && this.analyser) {
           const flt = new Float32Array(int16.length);
           for (let i = 0; i < int16.length; i++) flt[i] = int16[i] / 32768.0;
@@ -850,13 +873,45 @@
           }
           src.start(this.nextAudioTime);
           this.nextAudioTime += flt.length / this.sampleRate;
+        } else {
+          // Fallback direct spectral binning for Spectrogram waterfall
+          this._computeDirectSpectrum(int16);
+        }
+      }
+
+      _computeDirectSpectrum(int16) {
+        const bins = this.freqData.length;
+        const n = Math.min(int16.length, 512);
+        if (n < 16) return;
+        const stride = Math.max(1, Math.floor(n / 64));
+        for (let k = 0; k < bins; k += 2) {
+          let re = 0, im = 0;
+          const omega = (2 * Math.PI * k) / 1024;
+          for (let t = 0; t < n; t += stride) {
+            const val = int16[t] / 32768.0;
+            re += val * Math.cos(omega * t);
+            im -= val * Math.sin(omega * t);
+          }
+          const mag = Math.min(255, Math.floor(Math.sqrt(re * re + im * im) * (64 / (n / stride)) * 140));
+          this.freqData[k] = Math.floor(this.freqData[k] * 0.3 + mag * 0.7);
+          if (k + 1 < bins) this.freqData[k + 1] = this.freqData[k];
         }
       }
 
       getAnalysisData() {
-        if (!this.syntheticMode && this.analyser) {
+        if (!this.syntheticMode && this.analyser && this.audioCtx && this.audioCtx.state === 'running') {
           this.analyser.getByteFrequencyData(this.freqData);
           this.analyser.getByteTimeDomainData(this.timeData);
+        } else if (performance.now() - this.lastChunkTime > 300) {
+          // Smoothly decay waveform & spectrogram back to baseline when idle
+          for (let i = 0; i < this.timeData.length; i++) {
+            this.timeData[i] = Math.floor(this.timeData[i] * 0.88 + 128 * 0.12);
+          }
+          for (let i = 0; i < this.freqData.length; i++) {
+            this.freqData[i] = Math.floor(this.freqData[i] * 0.75);
+          }
+          this.currentDb = Math.max(-100, this.currentDb - 2.0);
+          this.isVoiceActive = false;
         }
         return {
           freqData: this.freqData,
@@ -877,7 +932,7 @@
         this.scope = scope;
 
         this.isConnected = false;
-        this.mode = 'serial';
+        this.mode = 'hub';
         this.ws = null;
         this.serialPort = null;
         this.serialReader = null;
@@ -895,7 +950,7 @@
         if (this.sparkline) this.spCtx = this.sparkline.getContext('2d');
 
         this._resetDashboard(false);
-        this._updateStatus('disconnected', 'USB Not Connected');
+        this._updateStatus('connecting', 'Connecting to Server...');
         this._setupLoop();
       }
 
@@ -1677,27 +1732,21 @@
       const telemetry = new TelemetryManager(audioProc, spec, scope);
 
       const modeSel = document.getElementById('mode-select');
-      const wsCtrl = document.getElementById('ws-controls');
+      const hubCtrl = document.getElementById('hub-controls');
       const serCtrl = document.getElementById('serial-controls');
       const simCtrl = document.getElementById('sim-controls');
 
       function showOnly(mode) {
-        wsCtrl.classList.add('hidden');
-        wsCtrl.classList.remove('flex');
-        serCtrl.classList.add('hidden');
-        serCtrl.classList.remove('flex');
-        simCtrl.classList.add('hidden');
-        simCtrl.classList.remove('flex');
+        if (hubCtrl) { hubCtrl.classList.add('hidden'); hubCtrl.classList.remove('flex'); }
+        if (serCtrl) { serCtrl.classList.add('hidden'); serCtrl.classList.remove('flex'); }
+        if (simCtrl) { simCtrl.classList.add('hidden'); simCtrl.classList.remove('flex'); }
 
-        if (mode === 'ws') {
-          wsCtrl.classList.remove('hidden');
-          wsCtrl.classList.add('flex');
+        if (mode === 'hub') {
+          if (hubCtrl) { hubCtrl.classList.remove('hidden'); hubCtrl.classList.add('flex'); }
         } else if (mode === 'serial') {
-          serCtrl.classList.remove('hidden');
-          serCtrl.classList.add('flex');
-        } else {
-          simCtrl.classList.remove('hidden');
-          simCtrl.classList.add('flex');
+          if (serCtrl) { serCtrl.classList.remove('hidden'); serCtrl.classList.add('flex'); }
+        } else if (mode === 'sim') {
+          if (simCtrl) { simCtrl.classList.remove('hidden'); simCtrl.classList.add('flex'); }
         }
       }
 
@@ -1708,8 +1757,8 @@
         telemetry._resetDashboard(false);
         showOnly(mode);
 
-        if (mode === 'ws') {
-          telemetry._updateStatus('disconnected', 'WebSocket Not Connected');
+        if (mode === 'hub') {
+          initBackendStream();
         } else if (mode === 'serial') {
           telemetry._updateStatus('disconnected', 'USB Not Connected');
         } else {
@@ -1719,27 +1768,24 @@
         telemetry._updateConnectionButtons();
       });
 
-      document.getElementById('btn-ws-connect').addEventListener('click', async () => {
-        if (telemetry.isConnected && telemetry.mode === 'ws') {
-          await telemetry.disconnect(true);
-          return;
-        }
-        const url = document.getElementById('ws-url').value.trim();
-        if (url) await telemetry.connectWebSocket(url);
-      });
+      const btnSerial = document.getElementById('btn-serial-connect');
+      if (btnSerial) {
+        btnSerial.addEventListener('click', async () => {
+          if (telemetry.isConnected && telemetry.mode === 'serial') {
+            await telemetry.disconnect(true);
+            return;
+          }
+          const baud = parseInt(document.getElementById('serial-baud').value, 10);
+          await telemetry.connectSerial(baud);
+        });
+      }
 
-      document.getElementById('btn-serial-connect').addEventListener('click', async () => {
-        if (telemetry.isConnected && telemetry.mode === 'serial') {
-          await telemetry.disconnect(true);
-          return;
-        }
-        const baud = parseInt(document.getElementById('serial-baud').value, 10);
-        await telemetry.connectSerial(baud);
-      });
-
-      document.getElementById('btn-sim-toggle').addEventListener('click', async () => {
-        await telemetry.startSimulation();
-      });
+      const btnSim = document.getElementById('btn-sim-toggle');
+      if (btnSim) {
+        btnSim.addEventListener('click', async () => {
+          await telemetry.startSimulation();
+        });
+      }
 
       document.getElementById('btn-clear-transcript').addEventListener('click', () => {
         telemetry.clearTranscript();
@@ -1774,8 +1820,8 @@
         audioProc.setMute(!e.target.checked);
       });
 
-      // Truthful initial state: USB mode selected, but no device is connected.
-      showOnly('serial');
+      // Initial state: Unified Server Hub
+      showOnly('hub');
       telemetry._updateConnectionButtons();
 
       // Trigger button helper
@@ -1788,17 +1834,25 @@
       };
 
       // Automatic FastAPI Backend Telemetry, Audio, and Whisper Bridge
+      let backendEvtSource = null;
       function initBackendStream() {
+        if (backendEvtSource) {
+          try { backendEvtSource.close(); } catch (_) {}
+        }
         const evtSource = new EventSource('/events');
+        backendEvtSource = evtSource;
 
         evtSource.onopen = () => {
           telemetry.isConnected = true;
-          telemetry._updateStatus('connected', 'Live Backend & ESP32 Connected');
+          telemetry._updateStatus('connected', 'Live Backend Connected');
         };
 
         evtSource.onmessage = (e) => {
           try {
             const msg = JSON.parse(e.data);
+            telemetry.packetsReceived++;
+            telemetry._setTxt('val-packets', String(telemetry.packetsReceived));
+
             if (msg.type === 'telemetry') {
               const t = msg.data;
               telemetry._handleTelem({
@@ -1808,8 +1862,22 @@
                 heapTotal: 262144,
                 heapMinFree: t.min_free_heap,
                 uptimeMs: t.uptime_ms,
-                latency: t.mic_peak,
+                latency: t.latency_ms !== undefined ? t.latency_ms : (t.rtt_ms !== undefined ? t.rtt_ms : null),
+                temp: t.temp !== undefined ? t.temp : t.temperature,
+                rssi: t.rssi
               });
+
+              // Ambient Mic Peak in Idle
+              if (!audioProc.isVoiceActive && t.mic_peak !== undefined && t.mic_peak > 0) {
+                const idleDb = 20 * Math.log10(Math.max(t.mic_peak, 1) / 32768.0);
+                const dbEl = document.getElementById('val-dbfs');
+                if (dbEl) dbEl.textContent = `${idleDb.toFixed(1)} dBFS`;
+                const dbBar = document.getElementById('db-meter-bar');
+                if (dbBar) {
+                  const width = Math.max(0, Math.min(100, (idleDb + 90) * (100 / 80)));
+                  dbBar.style.width = `${width}%`;
+                }
+              }
 
               // Real-Time Acoustic Gatekeeper Shield Update
               const gk = (t.gatekeeper || t.acoustic_state || 'SILENCE').toUpperCase();
@@ -1868,7 +1936,7 @@
               }
             } else if (msg.type === 'result') {
               const res = msg.data;
-              if (res.transcript) {
+              if (res && res.transcript) {
                 telemetry._setTranscriptText(res.transcript, true);
               }
             } else if (msg.type === 'audio_chunk' && msg.pcm16_b64) {

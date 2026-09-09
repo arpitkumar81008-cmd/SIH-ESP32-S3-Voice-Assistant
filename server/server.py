@@ -312,6 +312,13 @@ async def process_audio_chunk(session: Session, chunk: bytes, stop_callback, loo
     if session.state != "STREAMING":
         return
 
+    # Broadcast audio chunk to web dashboard for live Spectrogram & Oscilloscope!
+    try:
+        b64_pcm = base64.b64encode(chunk).decode('ascii')
+        await broadcast_event({"type": "audio_chunk", "pcm16_b64": b64_pcm})
+    except Exception:
+        pass
+
     session.chunks_received += 1
     session.audio_buffer.extend(chunk)
     session.vad_leftover.extend(chunk)
@@ -403,6 +410,8 @@ active_ws_conn = None
 # WebSocket Transport (Wi-Fi Mode)
 # --------------------------------------------------------------------------
 @app.websocket("/stream")
+@app.websocket("/ws")
+@app.websocket("/ws/audio")
 async def stream_endpoint(websocket: WebSocket):
     global active_ws_conn
     await websocket.accept()
