@@ -549,66 +549,65 @@ async def serial_listener_task():
                 if raw:
                     buffer.extend(raw)
 
-                    while len(buffer) >= 4:
-                        idx = buffer.find(b'\xAA\x55')
+                while len(buffer) >= 4:
+                    idx = buffer.find(b'\xAA\x55')
 
-                        if idx == -1:
-                            if b'\n' in buffer:
-                                line, _, remainder = buffer.partition(b'\n')
-                                buffer = bytearray(remainder)
-                                line_str = line.decode('utf-8', errors='ignore').strip()
-                                if line_str.startswith('{') and line_str.endswith('}'):
-                                    try:
-                                        payload = json.loads(line_str)
-                                        event = payload.get("event")
-                                        if event == "start":
-                                            await process_start_event(session, source=transport_label)
-                                        elif event in ("telemetry", "stats"):
-                                            payload["transport"] = transport_label
-                                            update_telemetry(payload)
-                                            await broadcast_event({"type": "telemetry", "data": latest_telemetry})
-                                    except Exception:
-                                        pass
-                            else:
-                                if len(buffer) > 4096:
-                                    del buffer[:2048]
+                    if idx == -1:
+                        while b'\n' in buffer:
+                            line, _, remainder = buffer.partition(b'\n')
+                            buffer = bytearray(remainder)
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str.startswith('{') and line_str.endswith('}'):
+                                try:
+                                    payload = json.loads(line_str)
+                                    event = payload.get("event")
+                                    if event == "start":
+                                        await process_start_event(session, source=transport_label)
+                                    elif event in ("telemetry", "stats"):
+                                        payload["transport"] = transport_label
+                                        update_telemetry(payload)
+                                        await broadcast_event({"type": "telemetry", "data": latest_telemetry})
+                                except Exception:
+                                    pass
+                        if len(buffer) > 4096:
+                            del buffer[:2048]
+                        break
+
+                    elif idx > 0:
+                        text_part = buffer[:idx]
+                        del buffer[:idx]
+                        for line in text_part.split(b'\n'):
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str.startswith('{') and line_str.endswith('}'):
+                                try:
+                                    payload = json.loads(line_str)
+                                    event = payload.get("event")
+                                    if event == "start":
+                                        await process_start_event(session, source=transport_label)
+                                    elif event in ("telemetry", "stats"):
+                                        payload["transport"] = transport_label
+                                        update_telemetry(payload)
+                                        await broadcast_event({"type": "telemetry", "data": latest_telemetry})
+                                except Exception:
+                                    pass
+
+                    else:
+                        # idx == 0: 0xAA 0x55 binary frame
+                        if len(buffer) < 4:
                             break
+                        frame_len = (buffer[2] << 8) | buffer[3]
 
-                        elif idx > 0:
-                            text_part = buffer[:idx]
-                            del buffer[:idx]
-                            for line in text_part.split(b'\n'):
-                                line_str = line.decode('utf-8', errors='ignore').strip()
-                                if line_str.startswith('{') and line_str.endswith('}'):
-                                    try:
-                                        payload = json.loads(line_str)
-                                        event = payload.get("event")
-                                        if event == "start":
-                                            await process_start_event(session, source=transport_label)
-                                        elif event in ("telemetry", "stats"):
-                                            payload["transport"] = transport_label
-                                            update_telemetry(payload)
-                                            await broadcast_event({"type": "telemetry", "data": latest_telemetry})
-                                    except Exception:
-                                        pass
+                        # Sanity check: valid frame length is 4 to 2048 bytes
+                        if frame_len < 4 or frame_len > 2048:
+                            del buffer[:2]  # Discard false header and resync
+                            continue
 
-                        else:
-                            # idx == 0: 0xAA 0x55 binary frame
-                            if len(buffer) < 4:
-                                break
-                            frame_len = (buffer[2] << 8) | buffer[3]
+                        if len(buffer) < 4 + frame_len:
+                            break  # Wait for rest of frame
 
-                            # Sanity check: valid frame length is 4 to 2048 bytes
-                            if frame_len < 4 or frame_len > 2048:
-                                del buffer[:2]  # Discard false header and resync
-                                continue
-
-                            if len(buffer) < 4 + frame_len:
-                                break  # Wait for rest of frame
-
-                            chunk = bytes(buffer[4:4 + frame_len])
-                            del buffer[:4 + frame_len]
-                            await process_audio_chunk(session, chunk, send_serial_stop, loop)
+                        chunk = bytes(buffer[4:4 + frame_len])
+                        del buffer[:4 + frame_len]
+                        await process_audio_chunk(session, chunk, send_serial_stop, loop)
 
                 # Timeout & silence watchdog
                 if session.state == "STREAMING":
