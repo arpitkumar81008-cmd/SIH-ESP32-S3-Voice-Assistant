@@ -557,6 +557,8 @@ async def serial_listener_task():
                             line, _, remainder = buffer.partition(b'\n')
                             buffer = bytearray(remainder)
                             line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str:
+                                print(f"[Serial RX] {line_str}")
                             if line_str.startswith('{') and line_str.endswith('}'):
                                 try:
                                     payload = json.loads(line_str)
@@ -567,8 +569,8 @@ async def serial_listener_task():
                                         payload["transport"] = transport_label
                                         update_telemetry(payload)
                                         await broadcast_event({"type": "telemetry", "data": latest_telemetry})
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"[Serial] JSON parse error: {e}")
                         if len(buffer) > 4096:
                             del buffer[:2048]
                         break
@@ -578,6 +580,8 @@ async def serial_listener_task():
                         del buffer[:idx]
                         for line in text_part.split(b'\n'):
                             line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str:
+                                print(f"[Serial RX] {line_str}")
                             if line_str.startswith('{') and line_str.endswith('}'):
                                 try:
                                     payload = json.loads(line_str)
@@ -588,8 +592,8 @@ async def serial_listener_task():
                                         payload["transport"] = transport_label
                                         update_telemetry(payload)
                                         await broadcast_event({"type": "telemetry", "data": latest_telemetry})
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"[Serial] JSON parse error: {e}")
 
                     else:
                         # idx == 0: 0xAA 0x55 binary frame
