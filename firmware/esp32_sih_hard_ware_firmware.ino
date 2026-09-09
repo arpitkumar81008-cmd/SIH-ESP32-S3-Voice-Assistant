@@ -119,7 +119,7 @@ enum AcousticState {
 volatile AcousticState acousticGateState = ACOUSTIC_SILENCE;
 
 // ---------------- TFLM MODEL & INFERENCE GLOBALS ----------------
-#define KWS_CONFIDENCE_THRESH   0   // Raw INT8 >= 0 corresponds to >= 50% softmax probability
+#define KWS_CONFIDENCE_THRESH   100 // Stricter threshold (was 0). 100/127 requires very high model confidence
 
 namespace {
   const tflite::Model* model = nullptr;

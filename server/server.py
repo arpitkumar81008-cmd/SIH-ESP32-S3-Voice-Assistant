@@ -258,12 +258,15 @@ async def finalize_session(session: Session, stop_callback, loop, reason="silenc
     except Exception as ex:
         print(f"[warn] Could not save WAV file: {ex}")
 
-    if duration_sec < 0.4 or (not session.speech_started and session.max_peak < 0.04):
-        print(f"[transcript] (Ambient noise / no speech detected, skipping Whisper: peak={session.max_peak:.3f})")
+    if duration_sec < 0.4:
+        print(f"[transcript] (Audio too short, skipping Whisper: duration={duration_sec:.2f}s)")
         session.reset()
         latest_metrics["state"] = "IDLE"
         await broadcast_event({"type": "state", "state": "IDLE"})
         return
+    
+    if not session.speech_started and session.max_peak < 0.04:
+        print(f"[transcript] (Warning: VAD did not detect speech, but running Whisper anyway. peak={session.max_peak:.3f})")
 
     t_whisper_start = time.perf_counter()
     transcript = await loop.run_in_executor(EXECUTOR, transcribe_sync, audio_bytes)
