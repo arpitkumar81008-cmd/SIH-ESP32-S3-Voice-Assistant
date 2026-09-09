@@ -198,6 +198,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 
 // ---------------- RING BUFFER HELPERS ----------------
 void ringBufferWrite(const int16_t *samples, size_t count) {
+  if (!ringBuffer) return;
   if (xSemaphoreTake(ringMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     for (size_t i = 0; i < count; i++) {
       ringBuffer[ringWriteIdx] = samples[i];
@@ -499,8 +500,8 @@ void audioCaptureTask(void *param) {
         dcTracker += (rawSample - dcTracker) >> 6;
         int32_t acSample = rawSample - dcTracker;
 
-        // Step 2: High Digital Gain (>> 7 provides 512x digital gain since the mic is extremely quiet)
-        int32_t scaled = acSample >> 7;
+        // Step 2: Digital Gain (>> 9 provides 128x digital gain. >> 16 would be standard 32-to-16 bit downsampling)
+        int32_t scaled = acSample >> 9;
         if (scaled > 32767) scaled = 32767;
         if (scaled < -32768) scaled = -32768;
 
@@ -720,13 +721,7 @@ void streamManagerTask(void *param) {
       deviceState = STATE_IDLE;
     }
 
-    // Manual 'T' trigger command
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == 'T' || c == 't') {
-        fireWakeWordTrigger();
-      }
-    }
+    // Manual trigger command removed to prevent false 't' triggering from JSON "stop" payloads
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }

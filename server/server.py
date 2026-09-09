@@ -230,6 +230,7 @@ async def process_start_event(session: Session, source="WS"):
 async def finalize_session(session: Session, stop_callback, loop, reason="silence"):
     if session.state != "STREAMING":
         return
+    session.state = "TRANSCRIBING"
 
     print(f"\n[vad] Finalizing utterance (reason: {reason}, peak: {session.max_peak:.3f})...")
     latest_metrics["state"] = "TRANSCRIBING"
