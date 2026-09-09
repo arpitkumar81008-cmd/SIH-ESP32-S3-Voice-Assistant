@@ -622,6 +622,7 @@ async def serial_listener_task():
                 await asyncio.sleep(0.002)
 
         except Exception as ex:
+            print(f"[Serial] Connection error: {ex}")
             active_serial_conn = None
             if ser and ser.is_open:
                 try: ser.close()
